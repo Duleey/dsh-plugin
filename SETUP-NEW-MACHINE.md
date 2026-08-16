@@ -27,11 +27,21 @@
 需要 Node `^22.19.0 || >=24.0.0`，包管理器 pnpm（版本由 harness 的 `packageManager` 字段锁定）。
 
 ```sh
-node -v                                    # 确认满足版本要求
-corepack enable pnpm --install-directory /opt/homebrew/bin
+node -v   # 确认满足版本要求
 ```
 
-harness 的部分构建脚本内部直接调用 `pnpm`，因此 shim 必须落在 `PATH` 上，不能只靠 `corepack pnpm` 前缀。
+harness 的部分构建脚本内部直接调用 `pnpm`，因此 shim 必须落在 `PATH` 上，不能只靠 `corepack pnpm` 前缀。把它装到 `corepack` 自身所在的目录即可 —— 那个目录必然已在 `PATH` 上，且随 Node 安装方式自动适配（Homebrew、nvm、apt、官方 tarball 各不相同）：
+
+```sh
+COREPACK_BIN="$(dirname "$(command -v corepack)")"
+corepack enable pnpm --install-directory "$COREPACK_BIN" \
+  || sudo corepack enable pnpm --install-directory "$COREPACK_BIN"
+pnpm -v   # 验证 shim 生效
+```
+
+系统级 Node（如 Linux 上 apt 装的 `/usr/bin`）目录不可写，此时前半句失败、由 `sudo` 兜住。nvm 或 Homebrew 装的 Node 目录属当前用户，不会走到 `sudo`。
+
+若 `corepack` 不存在（极少数精简发行版会剥掉），改用 `npm i -g pnpm@11.7.0`，版本要与 harness `package.json` 的 `packageManager` 字段一致。
 
 ### 2. 安装 harness
 
@@ -50,8 +60,11 @@ pnpm install --fetch-timeout 900000 --network-concurrency 2 --fetch-retries 5
 
 ### 3. 取插件仓库
 
+选一个放插件的目录（下文用 `PLUGIN_ROOT` 指代，可任意，`link:` 指向哪里都行）：
+
 ```sh
-cd ~/Desktop/workspace
+PLUGIN_ROOT="$HOME/workspace"   # Linux 上 ~/Desktop 通常不存在，按习惯自选
+mkdir -p "$PLUGIN_ROOT" && cd "$PLUGIN_ROOT"
 git clone git@github.com:Duleey/dsh-plugin.git
 ```
 
@@ -63,14 +76,14 @@ git clone git@github.com:Duleey/dsh-plugin.git
 
 ```sh
 cd <harness 源码目录>
-pnpm dsh plugin --profile web add link:$HOME/Desktop/workspace/dsh-plugin/dsh-deepseek-quota-left
+pnpm dsh plugin --profile web add "link:$PLUGIN_ROOT/dsh-plugin/dsh-deepseek-quota-left"
 ```
 
 这一条命令完成三件事：不存在时按模板初始化 `web` profile（`@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-web-app`）、把插件写入 `dependencies`、把插件名追加进 `dsh.profile.bundles`。前者决定「装到哪」，后者决定「是否加载」，缺一不可。
 
 `link:` 是软链而非拷贝：直接编辑本仓库内的文件即刻生效，且 `pnpm install` 不会覆盖。代价是 profile 的 `package.json` 里记录的是绝对路径，所以每台机器都要重跑这条命令。
 
-路径按新机器实际情况调整。`dsh plugin` 需要 `pnpm` 在 `PATH` 上（第 1 步已保证）。
+路径按新机器实际情况调整；`PLUGIN_ROOT` 若在新 shell 里已失效，直接写绝对路径。`dsh plugin` 需要 `pnpm` 在 `PATH` 上（第 1 步已保证）。
 
 ### 5. 放配置
 
