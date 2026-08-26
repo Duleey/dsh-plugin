@@ -47,6 +47,18 @@ function writePackage(base: string, name: string, manifest: unknown): string {
   return dir
 }
 
+/** Write a minimal package that Node's ESM resolver can actually import. */
+function writeLoadablePackage(base: string, name: string): string {
+  const dir = writePackage(base, name, {
+    name,
+    version: '1.0.0',
+    type: 'module',
+    exports: './index.js',
+  })
+  writeFileSync(join(dir, 'index.js'), 'export default {}\n')
+  return dir
+}
+
 /** Write a dsh bundle package (dsh.bundle.patch entry-list) at base/node_modules/<name>. */
 function writeBundle(base: string, name: string, version: string, patch: unknown[]): string {
   const dir = writePackage(base, name, {
@@ -145,6 +157,414 @@ describe('workspace-root hoisted bundles (#98 review B1)', () => {
     expect(bundle?.directory).toBe(root)
     expect(report.rows.map(r => r.id)).toEqual(['a-entry'])
     expect(report.summary.ok).toBe(true)
+  })
+})
+
+describe('user patch package resolution (#205)', () => {
+  const resolutionErrors = (errors: string[]): string[] =>
+    errors.filter(line => line.includes('loader package') || line.includes('loader specifier') || line.includes('has no module name'))
+
+  it('flags a missing package inserted by the profile patch as a boot failure', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      { insert: [{ id: 'rp-plugin', name: '@dsh-rp/missing' }] },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(report.rows).toContainEqual({
+      id: 'rp-plugin',
+      layer: 'user-patch',
+      kind: 'insert',
+      name: '@dsh-rp/missing',
+    })
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader package @dsh-rp/missing is not installed in the profile — the profile will fail to boot',
+    ])
+    expect(report.summary.ok).toBe(false)
+  })
+
+  it('normalizes a scoped package subpath to its installed npm package root', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: { '@scope/plugin': '^1.0.0' } })
+    const plugin = writePackage(dir, '@scope/plugin', {
+      name: '@scope/plugin',
+      version: '1.0.0',
+      type: 'module',
+      exports: { './runtime': './runtime.js' },
+    })
+    writeFileSync(join(plugin, 'runtime.js'), 'throw new Error("must not execute during check")\n')
+    writePackage(dir, 'legacy-package', { name: 'legacy-package', version: '1.0.0' })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      {
+        insert: [
+          { id: 'runtime', name: '@scope/plugin/runtime' },
+          { id: 'double-slash', name: 'legacy-package//index.js' },
+          { id: 'dot-segment', name: 'legacy-package/./index.js' },
+          { id: 'parent-segment', name: 'legacy-package/../legacy-package/index.js' },
+        ],
+      },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
+    expect(report.summary.ok).toBe(true)
+  })
+
+  it('accepts a profile package self-reference without a node_modules copy', () => {
+    const dir = pdir()
+    writeProfile(dir, {
+      name: 'self-profile',
+      exports: { '.': './index.js' },
+      dependencies: {},
+    })
+    writeFileSync(join(dir, 'index.js'), 'export default {}\n')
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([{
+      insert: [{ id: 'self', name: 'self-profile' }],
+    }]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(existsSync(join(dir, 'node_modules', 'self-profile'))).toBe(false)
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
+  })
+
+  it('does not treat exports:null as a resolvable profile self-reference', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'self-profile', exports: null, dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([{
+      insert: [{ id: 'self', name: 'self-profile' }],
+    }]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader package self-profile is not installed in the profile — the profile will fail to boot',
+    ])
+  })
+
+  it('accepts Node-resolvable legacy and Unicode package roots', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writePackage(dir, '_private', { name: '_private', version: '1.0.0' })
+    writePackage(dir, '@_scope/_pkg', { name: '@_scope/_pkg', version: '1.0.0' })
+    writePackage(dir, '插件', { name: '插件', version: '1.0.0' })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([{
+      insert: [
+        { id: 'private', name: '_private/runtime' },
+        { id: 'scoped-private', name: '@_scope/_pkg/runtime' },
+        { id: 'unicode', name: '插件/runtime' },
+      ],
+    }]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
+    expect(report.summary.ok).toBe(true)
+  })
+
+  it('uses the profile workspace-root fallback that is visible to the Loader', () => {
+    const profiles = join(tmp, 'profiles')
+    const dir = join(profiles, 'web')
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeLoadablePackage(profiles, 'workspace-plugin')
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      { insert: [{ id: 'workspace', name: 'workspace-plugin' }] },
+    ]))
+
+    expect(existsSync(join(dir, 'node_modules', 'workspace-plugin'))).toBe(false)
+    expect(existsSync(join(tmp, 'node_modules', 'workspace-plugin'))).toBe(false)
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
+    expect(report.summary.ok).toBe(true)
+  })
+
+  it('does not accept an install-only package that the profile Loader cannot see', () => {
+    const dir = pdir()
+    const dshInstall = join(tmp, 'dsh-install')
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeProfile(dshInstall, { name: '@deepseek-ai/dsh' })
+    writeLoadablePackage(dshInstall, '@issue205/host-only-plugin')
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      { insert: [{ id: 'host-only', name: '@issue205/host-only-plugin' }] },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: dshInstall, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader package @issue205/host-only-plugin is not installed in the profile — the profile will fail to boot',
+    ])
+  })
+
+  it('does not skip a broken nearer package directory for a healthy parent copy', () => {
+    const profiles = join(tmp, 'profiles')
+    const dir = join(profiles, 'web')
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeLoadablePackage(profiles, 'shadowed-plugin')
+    writeLoadablePackage(profiles, 'file-shadow-plugin')
+    mkdirSync(join(dir, 'node_modules', 'shadowed-plugin'), { recursive: true })
+    writeFileSync(join(dir, 'node_modules', 'file-shadow-plugin'), 'not a package directory')
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([{
+      insert: [
+        { id: 'shadowed', name: 'shadowed-plugin' },
+        { id: 'file-shadow', name: 'file-shadow-plugin' },
+      ],
+    }]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader package shadowed-plugin is not installed in the profile — the profile will fail to boot',
+    ])
+  })
+
+  it('does not check an insert skipped because its target group is missing', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      {
+        id: 'missing-group',
+        insert: [{ id: 'skipped', name: 'missing-but-never-loaded' }],
+      },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(report.rows.some(row => row.id === 'skipped')).toBe(false)
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
+    expect(report.summary.warnings).toContain(
+      'user-patch: missing-group — insert target not found',
+    )
+    expect(report.summary.ok).toBe(true)
+  })
+
+  it('checks a user package inserted into a group supplied by a bundle', () => {
+    const dir = pdir()
+    writeProfile(dir, {
+      name: 'web-profile',
+      dependencies: { 'base-bundle': '^1.0.0' },
+      dsh: { profile: { bundles: ['base-bundle'] } },
+    })
+    writeBundle(dir, 'base-bundle', '1.0.0', [
+      { insert: [{ id: 'bundle-group', name: 'cordis:group', group: true, config: [] }] },
+    ])
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      {
+        id: 'bundle-group',
+        insert: [{ id: 'user-child', name: 'missing-targeted-plugin' }],
+      },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(report.rows.find(row => row.id === 'user-child')?.layer).toBe('user-patch')
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader package missing-targeted-plugin is not installed in the profile — the profile will fail to boot',
+    ])
+  })
+
+  it('checks nested group children with the layer inherited from their patch', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      {
+        insert: [{
+          id: 'tools',
+          name: 'cordis:group',
+          group: true,
+          config: [{ id: 'nested-missing', name: 'nested-plugin' }],
+        }],
+      },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(report.rows.find(row => row.id === 'nested-missing')?.layer).toBe('user-patch')
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader package nested-plugin is not installed in the profile — the profile will fail to boot',
+    ])
+  })
+
+  it('checks the home patch and deduplicates repeated references within one layer', () => {
+    const dir = pdir()
+    const home = join(tmp, 'home')
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    mkdirSync(home, { recursive: true })
+    writeFileSync(join(home, 'cordis.patch.yml'), dump([
+      {
+        insert: [
+          { id: 'one', name: 'missing-home/runtime' },
+          { id: 'two', name: 'missing-home/worker' },
+        ],
+      },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: home })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'home-patch: loader package missing-home is not installed in the profile — the profile will fail to boot',
+    ])
+  })
+
+  it('ignores non-group rows disabled directly, by a parent, by a later layer, or by a truthy literal', () => {
+    const dir = pdir()
+    const home = join(tmp, 'home')
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    mkdirSync(home, { recursive: true })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      {
+        insert: [
+          { id: 'direct-off', name: 'missing-direct', disabled: true },
+          { id: 'truthy-off', name: 'missing-truthy', disabled: 'false' },
+          {
+            id: 'group-off',
+            name: 'cordis:group',
+            group: true,
+            disabled: true,
+            config: [{ id: 'child-off', name: 'missing-child' }],
+          },
+          { id: 'later-off', name: 'missing-later' },
+        ],
+      },
+    ]))
+    writeFileSync(join(home, 'cordis.patch.yml'), dump([
+      { id: 'later-off', disabled: true },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: home })
+
+    expect(report.rows.map(row => row.id)).toEqual([
+      'direct-off', 'truthy-off', 'group-off', 'child-off', 'later-off',
+    ])
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
+    expect(report.summary.ok).toBe(true)
+  })
+
+  it('still resolves custom group modules while their disabled state suppresses descendants', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      {
+        insert: [{
+          id: 'outer-off',
+          name: 'cordis:group',
+          group: true,
+          disabled: true,
+          config: [{
+            id: 'custom-group',
+            name: 'missing-custom-group',
+            group: true,
+            config: [{ id: 'suppressed-child', name: 'missing-child' }],
+          }],
+        }],
+      },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader package missing-custom-group is not installed in the profile — the profile will fail to boot',
+    ])
+    expect(report.summary.errors.some(line => line.includes('missing-child'))).toBe(false)
+  })
+
+  it('reports expression-gated missing modules as conditional warnings, never definite failures', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), [
+      '- insert:',
+      '  - id: maybe-plugin',
+      '    name: missing-conditional',
+      '    disabled: !!js process.platform === "win32"',
+      '',
+    ].join('\n'))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
+    expect(report.summary.warnings).toContain(
+      'user-patch: loader package missing-conditional is not installed in the profile — boot will fail if its disabled expression enables the entry',
+    )
+    expect(report.summary.ok).toBe(true)
+  })
+
+  it('reports enabled rows with a missing or empty module name', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      { insert: [{ id: 'missing-name' }, { id: 'empty-name', name: '' }] },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader entry "missing-name" has no module name — the profile will fail to boot',
+      'user-patch: loader entry "empty-name" has no module name — the profile will fail to boot',
+    ])
+  })
+
+  it('reports malformed bare specifiers instead of silently skipping them', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      {
+        insert: [
+          { id: 'scope-only', name: '@scope' },
+          { id: 'encoded', name: 'foo%bar' },
+        ],
+      },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([
+      'user-patch: loader specifier "@scope" is not a valid bare package name — the profile will fail to boot',
+      'user-patch: loader specifier "foo%bar" is not a valid bare package name — the profile will fail to boot',
+    ])
+  })
+
+  it('ignores builtins, relative or absolute modules, URLs, and names inside ordinary config', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), dump([
+      {
+        insert: [
+          { id: 'builtin', name: 'cordis:group' },
+          { id: 'node-builtin', name: 'node:path' },
+          { id: 'bare-builtin', name: 'fs/promises' },
+          { id: 'package-import', name: '#profile-plugin' },
+          { id: 'relative', name: './local-plugin.js' },
+          { id: 'absolute', name: join(dir, 'local-plugin.js') },
+          { id: 'url', name: 'file:///portable/plugin.js' },
+          {
+            id: 'configured',
+            name: 'cordis:group',
+            config: [{ name: 'ordinary-option-name' }],
+          },
+        ],
+      },
+    ]))
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
+    expect(report.summary.ok).toBe(true)
+  })
+
+  it('reports a malformed patch once without inventing a missing package', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writeFileSync(join(dir, 'cordis.patch.yml'), '- insert: [unterminated')
+
+    const report = analyzeProfile(dir, { dshInstallDir: null, homeDir: join(tmp, 'empty-home') })
+
+    expect(report.summary.errors).toEqual([
+      'user-patch: patch file is not a valid entry list',
+    ])
+    expect(resolutionErrors(report.summary.errors)).toEqual([])
   })
 })
 
@@ -376,6 +796,58 @@ describe('peer range mismatch', () => {
     expect(mismatch?.satisfied).toBe(false)
     expect(report.summary.warnings.some(w => w.includes('does not match'))).toBe(true)
   })
+
+  it('does not WARN about an optional peer that does not match (#275)', () => {
+    // `peerDependenciesMeta.optional` is the plugin saying "I work without
+    // this". classifyPeer already treats those as non-risk; the summary
+    // disagreeing meant a scary warning line for a plugin that is fine —
+    // including the market's own optional peer, on every profile that
+    // installs it.
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writePackage(dir, 'plugin-opt', {
+      name: 'plugin-opt',
+      version: '1.0.0',
+      peerDependencies: { '@deepseek-ai/dsh-llm': '^0.1.0' },
+      peerDependenciesMeta: { '@deepseek-ai/dsh-llm': { optional: true } },
+    })
+    writePackage(dir, '@deepseek-ai/dsh-llm', { name: '@deepseek-ai/dsh-llm', version: '0.2.0' })
+
+    const report = analyzeProfile(dir)
+    const mismatch = report.peerMismatches.find(m => m.plugin === 'plugin-opt')
+    // Still REPORTED — the diagnostics page shows it, and classifyPeer
+    // decides what it means. Only the summary warning is suppressed.
+    expect(mismatch?.satisfied).toBe(false)
+    expect(mismatch?.optional).toBe(true)
+    expect(report.summary.warnings.some(w => w.includes('plugin-opt'))).toBe(false)
+  })
+
+  it('accepts a rolling workspace peer resolved to its prerelease sibling (#317)', () => {
+    const dir = pdir()
+    writeProfile(dir, { name: 'web-profile', dependencies: {} })
+    writePackage(dir, 'workspace-plugin', {
+      name: 'workspace-plugin',
+      version: '0.1.1-rc.2',
+      peerDependencies: { '@deepseek-ai/dsh-invariants': 'workspace:^' },
+    })
+    writePackage(dir, '@deepseek-ai/dsh-invariants', {
+      name: '@deepseek-ai/dsh-invariants',
+      version: '0.1.1-rc.2',
+    })
+
+    const report = analyzeProfile(dir)
+    const peer = report.peerMismatches.find(
+      mismatch => mismatch.plugin === 'workspace-plugin'
+        && mismatch.name === '@deepseek-ai/dsh-invariants',
+    )
+
+    expect(peer).toMatchObject({
+      range: 'workspace:^',
+      resolved: '0.1.1-rc.2',
+      satisfied: true,
+    })
+    expect(report.summary.warnings.some(w => w.includes('workspace-plugin'))).toBe(false)
+  })
 })
 
 describe('pnpm-lock.yaml multi-version core packages', () => {
@@ -477,7 +949,26 @@ describe('satisfiesRange', () => {
     expect(satisfiesRange('2.1.0', '>=1.2.0 <2.0.0')).toBe(false)
     expect(satisfiesRange('2.0.0', '^1.0.0 || ^2.0.0')).toBe(true)
     expect(satisfiesRange('0.5.0', '^1.0.0 || ^2.0.0')).toBe(false)
-    expect(satisfiesRange('1.2.3', 'workspace:*')).toBeNull()
+    expect(satisfiesRange('1.2.3', 'catalog:default')).toBeNull()
+    expect(satisfiesRange('1.2.3-rc.1', 'catalog:default')).toBeNull()
+    expect(satisfiesRange('1.2.3', 'catalog:default || ^3.0.0')).toBeNull()
+    expect(satisfiesRange('3.1.0', 'catalog:default || ^3.0.0')).toBe(true)
+  })
+
+  it('materializes pnpm workspace protocol ranges against the resolved sibling (#317)', () => {
+    expect(satisfiesRange('0.1.1-rc.2', 'workspace:')).toBe(true)
+    expect(satisfiesRange('0.1.1-rc.2', 'workspace:*')).toBe(true)
+    expect(satisfiesRange('0.1.1-rc.2', 'workspace:^')).toBe(true)
+    expect(satisfiesRange('0.1.1-rc.2', 'workspace:~')).toBe(true)
+    expect(satisfiesRange('0.1.1-rc.2', 'workspace:^0.1.1-rc.1')).toBe(true)
+    expect(satisfiesRange('0.1.1-rc.2', 'workspace:^0.1.2-rc.1')).toBe(false)
+    expect(satisfiesRange('4.5.6', 'workspace:>= || ^3.9.0')).toBe(true)
+    expect(satisfiesRange('1.2.3', '^3.0.0 || workspace:>=')).toBe(true)
+    expect(satisfiesRange('1.2.3', 'workspace:>')).toBe(false)
+    expect(satisfiesRange('1.2.3', 'workspace:<')).toBe(false)
+    expect(satisfiesRange('1.2.3', 'workspace:<=')).toBe(true)
+    expect(satisfiesRange('1.2.3', 'workspace:1.2.x || ^3.0.0')).toBeNull()
+    expect(satisfiesRange('0.1.1-rc.2', 'workspace:../sibling')).toBeNull()
   })
 })
 

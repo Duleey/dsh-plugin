@@ -69,6 +69,20 @@ describe('classifyPnpmFailure', () => {
     expect(classifyPnpmFailure('[ERR_PNPM_FETCH_404] GET https://registry.npmjs.org/some-ghost: Not Found - 404')?.message).toContain('some-ghost')
   })
 
+  it('names a patch that no longer applies, and says the package went in unpatched (#222)', () => {
+    // pnpm exits 1 here (verified against 10.29.3) but has ALREADY written
+    // the package without the patch, so the profile keeps the pristine
+    // version the patch existed to fix — and that only shows up at the next
+    // boot. The message has to say so, or the user reads "install failed"
+    // and does not know their profile is now holding a broken bundle.
+    const failed = classifyPnpmFailure('ERR_PNPM_PATCH_FAILED  Could not apply patch /home/u/.dsh/profiles/web/patches/dsh-plugin-guardian@1.1.0.patch to /home/u/.dsh/profiles/web/node_modules/.pnpm/x/node_modules/dsh-plugin-guardian')
+    expect(failed?.code).toBe('patch-failed')
+    expect(failed?.recoverable).toBe(false)
+    expect(failed?.message).toContain('dsh-plugin-guardian@1.1.0.patch')
+    expect(failed?.message).toContain('没打补丁的原版')
+    expect(failed?.message).toContain('patchedDependencies')
+  })
+
   it('recognizes momentary network failures — and only those — as transient (#83)', () => {
     const flake = classifyPnpmFailure('FetchError: request to https://codeload.github.com/o/r/tar.gz/abc failed, reason: socket hang up')
     expect(flake?.code).toBe('transient-network')
@@ -113,12 +127,70 @@ describe('provisionHint (#142 / #108 / #32)', () => {
     const eperm = provisionHint('Internal Error: EPERM: operation not permitted, open \'D:\\nodejs\\pnpm.CMD\'', 'npm error ... try running the command again as root/Administrator.')
     expect(eperm).toContain('brew install pnpm')
     expect(eperm).toContain('管理员')
-    // #32: no Node on PATH at all — the button is a dead end, say so.
-    expect(provisionHint('spawn corepack ENOENT', 'spawn npm ENOENT')).toContain('找不到 Node')
+    // #32: no toolchain on PATH at all — the button is a dead end, say so.
+    expect(provisionHint('spawn corepack ENOENT', 'spawn npm ENOENT')).toContain('找不到 npm/corepack')
     // Restricted network: the corepack shim cannot fetch pnpm either.
     expect(provisionHint('', 'npm error network request to https://registry.npmjs.org failed, reason: ETIMEDOUT'))
       .toContain('镜像')
-    // Unrecognized output stays undefined rather than guessing.
-    expect(provisionHint('', 'some unknown failure')).toBeUndefined()
+    // Unrecognized output no longer stays silent (#228): every step can
+    // report success and pnpm still not run, and that is the case a user has
+    // the least chance of working out alone. It must not MISFILE itself as
+    // one of the recognized causes, though — that would send them to fix
+    // something they do not have.
+    const fallback = provisionHint('', 'some unknown failure')
+    expect(fallback).toMatch(/which pnpm|where pnpm/)
+    expect(fallback).not.toContain('找不到 npm/corepack')
+    expect(fallback).not.toContain('镜像')
+  })
+
+  /** #228 again, the other half: "我是有 pnpm 的，可以正常使用". A binary that
+   * IS on the path and exits non-zero is a different problem from one that
+   * is not there, and the fix for it is not a path. Sending that user to set
+   * PNPM_HOME is advice for the opposite situation. */
+  it('does not blame the path when pnpm is found and simply fails to run', async () => {
+    const { provisionHint } = await import('../src/dsh-cli.ts')
+    const failing = provisionHint('', 'some unknown failure', true, {
+      kind: 'failed',
+      output: 'Error: Cannot find matching keyid: {"signatures":[...]}',
+    })
+    // Its own output is the explanation, so it is shown.
+    expect(failing).toContain('Cannot find matching keyid')
+    // And the advice for the OTHER problem is explicitly absent.
+    expect(failing).not.toContain('PNPM_HOME=<')
+    expect(failing).toContain('PNPM_HOME 没有用')
+
+    // A probe that found nothing keeps the original path-shaped advice.
+    const absent = provisionHint('', 'some unknown failure', true, { kind: 'missing', output: 'spawn pnpm ENOENT' })
+    expect(absent).toMatch(/which pnpm|where pnpm/)
+    expect(absent).toContain('PNPM_HOME')
+  })
+})
+
+describe('ERR_PNPM_UNEXPECTED_STORE (#244)', () => {
+  const OUTPUT = ` ERR_PNPM_UNEXPECTED_STORE  Unexpected store location
+The dependencies at "C:\\Users\\lenovo\\.dsh\\profiles\\web\\node_modules" are currently linked from the store at "C:\\Users\\lenovo\\.pnpm-store\\v11".
+pnpm now wants to use the store at "C:\\Users\\lenovo\\AppData\\Local\\pnpm\\store\\v11" to link dependencies.`
+
+  it('recognizes it and names BOTH store paths, which is what the user has to act on', () => {
+    const failure = classifyPnpmFailure(OUTPUT)
+    expect(failure?.code).toBe('unexpected-store')
+    // The linked store comes first: it is the one to pass to --store-dir.
+    expect(failure?.message).toContain('C:\\Users\\lenovo\\.pnpm-store\\v11')
+    expect(failure?.message).toContain('C:\\Users\\lenovo\\AppData\\Local\\pnpm\\store\\v11')
+    expect(failure?.message).toContain('--store-dir')
+  })
+
+  it('is NOT marked recoverable — the market must not relink a whole node_modules on a guess', () => {
+    // `recoverable` drives an automatic `pnpm install` retry. On pnpm 11 the
+    // store can only be set by CLI flag, so self-healing would mean adopting
+    // whatever path .modules.yaml names — possibly stale, or on a drive that
+    // is gone — and relinking everything to do it.
+    expect(classifyPnpmFailure(OUTPUT)?.recoverable).toBe(false)
+  })
+
+  it('still classifies when the paths cannot be parsed, rather than falling through', () => {
+    const failure = classifyPnpmFailure('ERR_PNPM_UNEXPECTED_STORE something reworded upstream')
+    expect(failure?.code).toBe('unexpected-store')
+    expect(failure?.message).toContain('--store-dir')
   })
 })

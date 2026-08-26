@@ -8,8 +8,8 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { InstallResult, PluginRunner } from './dsh-cli.ts'
-import { classifyPnpmFailure, isTransientPnpmFailure } from './pnpm-compat.ts'
-import { conflictingEntryIds, hasDshManifest, hasLoadableEntry, pluginSubdirs, profileDir, readInstalled, readProfileBundles } from './profile.ts'
+import { classifyPnpmFailure, HOST_NAMESPACE_RE, isTransientPnpmFailure } from './pnpm-compat.ts'
+import { conflictingEntryIds, hasDshManifest, hasLoadableEntry, pluginSubdirs, profileDir, readInstalled, readManifestDeps, readProfileBundles } from './profile.ts'
 import { logEvent } from './log.ts'
 import { cleanOrphanedStore } from './store.ts'
 
@@ -24,6 +24,49 @@ export const RELEASE_AGE_OVERRIDE = '--config.minimumReleaseAge=0'
  * this override once. Scoped to a single command like RELEASE_AGE_OVERRIDE.
  */
 export const FETCH_TIMEOUT_OVERRIDE = '--config.fetchTimeout=600000'
+
+/**
+ * Stop pnpm downloading a plugin's peer dependencies (#289 by @00080000).
+ *
+ * The last resort for a peer that cannot be downloaded because it does not
+ * exist on any registry: the dsh runtime injects several `@deepseek-ai/*`
+ * packages and never publishes them, and since pnpm 8 `auto-install-peers`
+ * defaults on, so pnpm walks the peer list and 404s on one.
+ *
+ * Only on the retry, never by default. Turning it off wholesale would also
+ * stop pnpm installing the peers a plugin legitimately needs from npm, and
+ * that failure would surface much later — as a missing module at runtime
+ * rather than a clear error at install time. Narrow beats early here.
+ *
+ * Verified against pnpm 10.29.3: `peerDependencyRules.ignoreMissing` does
+ * NOT prevent the fetch (it only silences the warning), so this flag is the
+ * only lever that actually works.
+ */
+export const AUTO_INSTALL_PEERS_OFF = '--config.auto-install-peers=false'
+
+/**
+ * Whether an unresolvable package is a host peer pnpm went looking for on
+ * its own, rather than something the profile actually asks for.
+ *
+ * The same 404 means two different things and wants two different answers.
+ * A `@deepseek-ai/*` package that IS in the profile manifest is a ghost
+ * entry — left by an earlier failed operation, or hand-added — and the user
+ * has to remove that line; retrying would only fail again. One that is NOT
+ * in the manifest was never asked for by anybody: pnpm reached it by walking
+ * an installed plugin's peerDependencies, which in this ecosystem name what
+ * the runtime provides rather than what npm carries.
+ *
+ * Reading the manifest is what separates them, so this cannot live in the
+ * pure classifier.
+ */
+export function isUnpublishedHostPeer(
+  pkg: string | undefined,
+  profile: string,
+  explicitDir?: string,
+): boolean {
+  if (pkg === undefined || !HOST_NAMESPACE_RE.test(pkg)) return false
+  return !Object.hasOwn(readManifestDeps(profile, explicitDir), pkg)
+}
 
 /**
  * Run one plugin command with automatic recovery from three known pnpm traps:
@@ -45,7 +88,12 @@ export const FETCH_TIMEOUT_OVERRIDE = '--config.fetchTimeout=600000'
  * appended to stderr so the UI shows an actionable message instead of a
  * wall of text (#20 bug 3). Cancelled runs are never recovered.
  */
-export async function withHoistRecovery(run: PluginRunner, profile: string, pluginArgs: string[]): Promise<InstallResult> {
+export async function withHoistRecovery(
+  run: PluginRunner,
+  profile: string,
+  pluginArgs: string[],
+  profileDirectory?: string,
+): Promise<InstallResult> {
   let result = await run(profile, pluginArgs)
   const ok = (r: InstallResult): boolean => r.exitCode === 0 && !r.timedOut && !r.cancelled
   if (!ok(result) && !result.cancelled) {
@@ -63,6 +111,18 @@ export async function withHoistRecovery(run: PluginRunner, profile: string, plug
     ) {
       logEvent('warn', 'install', `a too-young release blocks pnpm's lockfile verification (#39) — retrying once with ${RELEASE_AGE_OVERRIDE}`)
       result = await run(profile, [pluginArgs[0], RELEASE_AGE_OVERRIDE, ...pluginArgs.slice(1)])
+    } else if (
+      failure?.code === 'fetch-404'
+      && isUnpublishedHostPeer(failure.pkg, profile, profileDirectory)
+      && (pluginArgs[0] === 'add' || pluginArgs[0] === 'remove')
+      && !pluginArgs.includes(AUTO_INSTALL_PEERS_OFF)
+    ) {
+      // The plugin is fine; pnpm went looking for a package the host injects
+      // and npm has never carried. Every fresh profile hits this, whatever
+      // the plugin, so failing here would be failing for something the user
+      // cannot fix and did not cause.
+      logEvent('warn', 'install', `${failure.pkg ?? 'a host package'} is a peer the runtime provides and npm does not carry (#289) — retrying once with ${AUTO_INSTALL_PEERS_OFF}`)
+      result = await run(profile, [pluginArgs[0], AUTO_INSTALL_PEERS_OFF, ...pluginArgs.slice(1)])
     } else if (
       failure?.code === 'transient-network'
       && (pluginArgs[0] === 'add' || pluginArgs[0] === 'remove')
@@ -92,9 +152,37 @@ export async function withHoistRecovery(run: PluginRunner, profile: string, plug
     // gone (the name carries it), so a live download is never touched.
     await cleanOrphanedStore(run, profile)
     const failure = classifyPnpmFailure(`${result.stderr}\n${result.stdout}`)
-    if (failure !== null) result = { ...result, stderr: `${result.stderr}\n\n${failure.message}` }
+    if (failure !== null) {
+      result = { ...result, stderr: `${result.stderr}\n\n${failure.message}` }
+    } else if (result.pnpmError !== undefined && result.pnpmError !== '') {
+      // Nothing matched, but pnpm DID say what went wrong — in its ndjson
+      // stream, which never reaches stderr. Without this the user is shown
+      // the tail of dsh's wrapper output ("pnpm failed in profile
+      // directory …"), which is byte-identical for every possible cause and
+      // is why #244, #192 and #138 all read as "the UI shows a stack tail".
+      //
+      // An unrecognized error is exactly the case where the raw text is
+      // worth the most: a classified one has a written explanation, this one
+      // has only pnpm's own words, and hiding them leaves nothing at all.
+      const code = result.pnpmErrorCode === undefined ? '' : `${result.pnpmErrorCode}: `
+      result = { ...result, stderr: `${result.stderr}\n\n${code}${result.pnpmError}` }
+    }
   }
   return result
+}
+
+/**
+ * The most specific description of a failed run available, for logs.
+ *
+ * pnpm's structured error beats the stderr tail whenever there is one — see
+ * withHoistRecovery above for why the tail is nearly worthless here.
+ */
+export function failureDetail(result: InstallResult, limit = 300): string {
+  if (result.pnpmError !== undefined && result.pnpmError !== '') {
+    const code = result.pnpmErrorCode === undefined ? '' : `${result.pnpmErrorCode}: `
+    return `${code}${result.pnpmError}`.slice(0, limit)
+  }
+  return (result.stderr || result.stdout).slice(-limit)
 }
 
 /**
@@ -149,11 +237,16 @@ export async function retargetCollections(
  * a web profile (both declare `id: storage`) leaves DSH unable to START —
  * an error naming neither plugin, from which the market's own page is
  * unreachable. Such a package is removed like any other bricking piece.
- * @returns names kept, names removed as broken, and the id conflicts found.
+ * @returns names added by this run, names kept, names removed as broken,
+ * and the id conflicts found. `added` is reported separately from `keep`
+ * because an EMPTY `added` is a different failure from "everything added was
+ * unloadable": it means the install reported success without touching the
+ * profile at all, which is a broken plugin-command channel rather than
+ * anything wrong with the plugin (#258).
  */
 export async function validateAddedPlugins(
   run: PluginRunner, profile: string, before: Set<string>, explicitDir?: string,
-): Promise<{ keep: string[]; removedBroken: string[]; conflicts: { name: string; id: string; owner: string }[] }> {
+): Promise<{ added: string[]; keep: string[]; removedBroken: string[]; conflicts: { name: string; id: string; owner: string }[] }> {
   const dir = profileDir(profile, explicitDir)
   const addedNow = Object.keys(readInstalled(profile, dir)).filter(n => !before.has(n))
   const keep: string[] = []
@@ -183,7 +276,28 @@ export async function validateAddedPlugins(
     }
     keep.push(n)
   }
-  return { keep, removedBroken, conflicts }
+  return { added: addedNow, keep, removedBroken, conflicts }
+}
+
+/**
+ * Group flat `{id, owner}` conflict hits by the installed plugin that owns
+ * them. What the user has to decide is which PLUGINS to uninstall, not which
+ * ids to resolve, so one row per owner is the unit the market renders and
+ * acts on. Flattening the other way (one row per id) also misattributes when
+ * a candidate clashes with several installed plugins at once.
+ * @param conflicts flat hits as returned by {@link validateAddedPlugins}.
+ * @returns one entry per owner, owners and ids both in first-seen order.
+ */
+export function groupConflictsByOwner(
+  conflicts: readonly { id: string; owner: string }[],
+): { owner: string; ids: string[] }[] {
+  const byOwner = new Map<string, string[]>()
+  for (const hit of conflicts) {
+    const ids = byOwner.get(hit.owner)
+    if (ids === undefined) byOwner.set(hit.owner, [hit.id])
+    else if (!ids.includes(hit.id)) ids.push(hit.id)
+  }
+  return [...byOwner].map(([owner, ids]) => ({ owner, ids }))
 }
 
 /**

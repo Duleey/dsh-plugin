@@ -10,8 +10,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { InstallResult } from '../src/dsh-cli.ts'
 import {
-  FETCH_TIMEOUT_OVERRIDE, isStaleUpdate, parseIgnoredBuilds, parsePrepareNotAllowed,
-  retargetCollections, validateAddedPlugins, withHoistRecovery,
+  failureDetail, FETCH_TIMEOUT_OVERRIDE, groupConflictsByOwner, isStaleUpdate, parseIgnoredBuilds,
+  parsePrepareNotAllowed, retargetCollections, validateAddedPlugins, withHoistRecovery,
 } from '../src/install.ts'
 import { profileDir } from '../src/profile.ts'
 
@@ -143,6 +143,26 @@ describe('validateAddedPlugins (#18 / #21)', () => {
     const { keep, conflicts } = await validateAddedPlugins(recordingRunner().run, 'web', new Set(['plug-a']))
     expect(keep).toEqual(['plug-b'])
     expect(conflicts).toEqual([])
+  })
+
+  it('groups clash hits by the installed plugin that owns them', () => {
+    // The market asks the user to uninstall PLUGINS, so the owner is the unit
+    // it renders and acts on; a candidate hitting several owners at once has
+    // to keep each id with the one that declares it.
+    expect(groupConflictsByOwner([
+      { id: 'storage', owner: 'dsh-tui-core' },
+      { id: 'panel', owner: 'dsh-panel-kit' },
+      { id: 'terminal', owner: 'dsh-tui-core' },
+    ])).toEqual([
+      { owner: 'dsh-tui-core', ids: ['storage', 'terminal'] },
+      { owner: 'dsh-panel-kit', ids: ['panel'] },
+    ])
+  })
+
+  it('groups a clean single clash into one row, and nothing into nothing', () => {
+    expect(groupConflictsByOwner([{ id: 'storage', owner: 'plug-a' }]))
+      .toEqual([{ owner: 'plug-a', ids: ['storage'] }])
+    expect(groupConflictsByOwner([])).toEqual([])
   })
 
   it('keeps a carrier bundle that mounts other installed packages (#103)', async () => {
@@ -278,5 +298,98 @@ describe('parsePrepareNotAllowed (#68)', () => {
     const ndjson = String.raw`{"name":"pnpm","level":"error","err":{"message":"Failed to prepare git-hosted package fetched from \"https://codeload.github.com/s/r/tar.gz/abc\": The git-hosted package \"dsh-queue-plus@0.3.0\" needs to execute build scripts but is not in the \"allowBuilds\" allowlist."}}`
     expect(parsePrepareNotAllowed(ndjson, '')).toBe('dsh-queue-plus')
     expect(parsePrepareNotAllowed('', ndjson.replace('dsh-queue-plus@0.3.0', '@scope/pkg@1.0.0'))).toBe('@scope/pkg')
+  })
+})
+
+describe("pnpm's own error survives to the surface (#244/#192/#138)", () => {
+  const base: InstallResult = {
+    exitCode: 1, timedOut: false, cancelled: false,
+    // What the market actually gets on stderr: dsh's wrapper line, byte-for-byte
+    // identical for every possible cause. This is the "stack tail" three
+    // separate reports describe seeing in the UI.
+    stderr: 'dsh: pnpm failed in profile directory ~/.dsh/profiles/web',
+    stdout: '',
+  }
+
+  it('prefers pnpm\'s structured error over the useless wrapper tail', () => {
+    expect(failureDetail({
+      ...base,
+      pnpmError: 'Unexpected store location',
+      pnpmErrorCode: 'ERR_PNPM_UNEXPECTED_STORE',
+    })).toBe('ERR_PNPM_UNEXPECTED_STORE: Unexpected store location')
+  })
+
+  it('falls back to the stderr tail when pnpm gave no structured error', () => {
+    expect(failureDetail(base)).toContain('pnpm failed in profile directory')
+  })
+
+  it('uses stdout when stderr is empty, as before', () => {
+    expect(failureDetail({ ...base, stderr: '', stdout: 'something on stdout' }))
+      .toBe('something on stdout')
+  })
+
+  it('appends pnpm\'s own words when nothing classified the failure', async () => {
+    // The whole point: an UNRECOGNIZED error is where the raw text is worth
+    // the most, because there is no written explanation to show instead.
+    const run = async (): Promise<InstallResult> => ({
+      ...base,
+      pnpmError: 'Something upstream has never seen before',
+      pnpmErrorCode: 'ERR_PNPM_BRAND_NEW',
+    })
+    const result = await withHoistRecovery(run, 'web', ['add', 'x'])
+    expect(result.stderr).toContain('ERR_PNPM_BRAND_NEW: Something upstream has never seen before')
+  })
+
+  it('leaves a CLASSIFIED failure to its written explanation, not the raw text', async () => {
+    // A recognized error already has an actionable bilingual message; pasting
+    // pnpm's raw prose after it would just make the banner longer.
+    const run = async (): Promise<InstallResult> => ({
+      ...base,
+      stdout: 'ERR_PNPM_ADDING_TO_ROOT some raw pnpm prose',
+      pnpmError: 'some raw pnpm prose',
+      pnpmErrorCode: 'ERR_PNPM_ADDING_TO_ROOT',
+    })
+    const result = await withHoistRecovery(run, 'web', ['add', 'x'])
+    expect(result.stderr).toContain('this is a market bug')
+    expect(result.stderr).not.toContain('ERR_PNPM_ADDING_TO_ROOT: some raw pnpm prose')
+  })
+})
+
+describe('validateAddedPlugins separates "added nothing" from "added junk" (#258)', () => {
+  it('reports an empty `added` when the plugin command changed nothing', async () => {
+    // The Desktop channel in the report exited 0 without touching the
+    // profile. Blaming the plugin ("needs a build step / ships no
+    // artifacts") sent the reporter chasing allowBuilds for a plugin that
+    // ships a complete lib/.
+    const dir = profileDir('web')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ dependencies: { existing: '^1.0.0' } }))
+    const run = async (): Promise<InstallResult> => ({
+      exitCode: 0, timedOut: false, cancelled: false, stdout: '', stderr: '',
+    })
+    const result = await validateAddedPlugins(run, 'web', new Set(['existing']))
+    expect(result.added).toEqual([])
+    expect(result.keep).toEqual([])
+    // No removals either — nothing arrived to remove. That pairing is what
+    // distinguishes this from "everything added was unloadable".
+    expect(result.removedBroken).toEqual([])
+  })
+
+  it('reports what arrived when the additions were unloadable', async () => {
+    const dir = profileDir('web')
+    mkdirSync(join(dir, 'node_modules', 'junk'), { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ dependencies: { junk: '^1.0.0' } }))
+    // No dsh manifest → removed as broken.
+    writeFileSync(join(dir, 'node_modules', 'junk', 'package.json'), JSON.stringify({ name: 'junk' }))
+    const removed: string[] = []
+    const run = async (_p: string, args: string[]): Promise<InstallResult> => {
+      if (args[0] === 'remove') removed.push(args[1]!)
+      return { exitCode: 0, timedOut: false, cancelled: false, stdout: '', stderr: '' }
+    }
+    const result = await validateAddedPlugins(run, 'web', new Set())
+    expect(result.added).toEqual(['junk'])
+    expect(result.keep).toEqual([])
+    expect(result.removedBroken).toEqual(['junk'])
+    expect(removed).toEqual(['junk'])
   })
 })

@@ -19,6 +19,8 @@
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { asChannel, type Channel } from './channels.ts'
+import { asRegion, type Region } from './regions.ts'
 import { logEvent } from './log.ts'
 
 interface HotRow {
@@ -167,6 +169,34 @@ export interface MarketState {
   groups: Record<string, string[]>
   /** Display order of group names; "ungrouped" is implicit and never listed. */
   groupOrder: string[]
+  /**
+   * The release channel the user PICKED, absent until they pick one.
+   *
+   * Absent is not the same as 'stable': with no choice on record the channel
+   * is derived from the running build, so installing a prerelease by hand
+   * puts you on the beta channel without a second step. Once chosen, the
+   * choice is the answer — including "stable" while a beta is running, which
+   * is how someone gets back off the channel.
+   */
+  channel?: Channel
+  /**
+   * The download region in force, absent until something has decided one.
+   *
+   * Absent means "nobody has decided yet", which is what triggers the
+   * one-time network probe. Once a value is here — whether the probe wrote
+   * it or the user picked it — no further probing happens, so the market
+   * does not silently change routes between runs.
+   */
+  region?: Region
+  /**
+   * Whether `region` was chosen by the probe rather than by the user.
+   *
+   * Only drives a one-time notice explaining why the market picked what it
+   * picked. A user who never learns a route was chosen for them has no way
+   * to know the setting exists, and no reason to look for it when something
+   * downloads oddly.
+   */
+  regionAuto?: boolean
 }
 
 /** Unique non-empty strings in `value`, order preserved. */
@@ -194,6 +224,9 @@ export function readMarketState(profileDir: string): MarketState {
       disabledSkins?: unknown
       groups?: unknown
       groupOrder?: unknown
+      channel?: unknown
+      region?: unknown
+      regionAuto?: unknown
     }
     const disabled = uniqueStrings(state.disabled !== undefined ? state.disabled : state.disabledSkins)
     const groups: Record<string, string[]> = {}
@@ -206,6 +239,11 @@ export function readMarketState(profileDir: string): MarketState {
       disabled: new Set(disabled),
       groups,
       groupOrder: uniqueStrings(state.groupOrder),
+      channel: asChannel(state.channel) ?? undefined,
+      region: asRegion(state.region) ?? undefined,
+      // Only meaningful beside a region, and only when true: a stray flag
+      // with no region would promise a notice about a choice nobody made.
+      regionAuto: state.regionAuto === true && asRegion(state.region) !== null ? true : undefined,
     }
   } catch {
     return { disabled: new Set(), groups: {}, groupOrder: [] }
@@ -219,6 +257,13 @@ export function writeMarketState(profileDir: string, state: MarketState): void {
     disabled: [...state.disabled],
     groups: state.groups,
     groupOrder: state.groupOrder,
+    // Omitted while unchosen, so "never picked" survives a round trip and
+    // keeps deriving from the running build.
+    ...(state.channel === undefined ? {} : { channel: state.channel }),
+    // Same reasoning, different consequence: an absent region is what makes
+    // the probe run, so writing a default here would mean it never does.
+    ...(state.region === undefined ? {} : { region: state.region }),
+    ...(state.regionAuto === true ? { regionAuto: true } : {}),
   }))
 }
 
@@ -454,3 +499,22 @@ export function patchLayerManages(controls: { ids: Set<string>; names: Set<strin
   return controls.ids.has(rowId) || controls.names.has(name)
 }
 
+
+/**
+ * Delete the market's own state directory.
+ *
+ * `cleanHotDir` wipes the ephemeral hot-mount inputs on every boot but
+ * deliberately preserves `state.json` — the disable list and custom groups
+ * are the user's durable choices. Uninstalling the market is the one moment
+ * where removing them is the right thing, and only when the user asked.
+ * @returns true when a directory was there to remove.
+ */
+export function purgeMarketState(profileDir: string): boolean {
+  const dir = join(profileDir, HOT_DIR)
+  try {
+    rmSync(dir, { recursive: true, force: true })
+    return true
+  } catch {
+    return false
+  }
+}

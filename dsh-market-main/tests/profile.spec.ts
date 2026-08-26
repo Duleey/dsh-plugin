@@ -6,10 +6,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
-  conflictingEntryIds, entryArtifactExists, hasDshManifest, pluginSubdirs, profileDir,
-  readInstalled, readInstalledManifest, readInstalledVersion, readLockCommits,
+  addProfileBundle, conflictingEntryIds, dropFromManifest, entryArtifactExists, hasDshManifest, hasLoadableEntry, isDshProfileName, pluginSubdirs, profileDir,
+  readInstalled, readInstalledManifest, readInstalledRepoEvidence, readInstalledRepoIdentities, readInstalledVersion, readLockCommits,
+  removeProfileBundle,
 } from '../src/profile.ts'
 
 let home: string
@@ -29,6 +30,27 @@ function writeProfile(manifest: unknown): string {
   return dir
 }
 
+describe('profile names (#260)', () => {
+  it('matches the DSH profile directory contract instead of an ASCII-only subset', () => {
+    for (const name of ['web', '011-rc.2', '测试001', '工作 profile', 'Профиль-2']) {
+      expect(isDshProfileName(name)).toBe(true)
+      expect(profileDir(name)).toBe(join(home, 'profiles', name))
+    }
+  })
+
+  it('still rejects every traversal-shaped or launcher-owned name DSH rejects', () => {
+    for (const name of ['', '.', '..', 'node_modules', 'a/b', 'a\\b', 'a\0b']) {
+      expect(isDshProfileName(name)).toBe(false)
+      expect(() => profileDir(name)).toThrow('invalid profile name')
+    }
+  })
+
+  it('keeps a host-authoritative Desktop directory independent of its display name', () => {
+    const explicit = join(home, 'desktop-owned')
+    expect(profileDir('../display-only', explicit)).toBe(explicit)
+  })
+})
+
 describe('readInstalled', () => {
   it('filters exactly the in-box bundles — scoped COMMUNITY plugins stay (#28)', () => {
     expect(readInstalled('web')).toEqual({})
@@ -46,6 +68,29 @@ describe('readInstalled', () => {
       '@deepseek-ai/dsh-security-audit': 'github:omdsh-dev/dsh-security-audit',
       dshmarket: '^1.2.3',
     })
+  })
+})
+
+describe('dropFromManifest (half-uninstall reconcile)', () => {
+  it('drops the package from dependencies AND dsh.profile.bundles, leaving every other field untouched', () => {
+    writeProfile({
+      name: 'web',
+      private: true,
+      dependencies: { 'dsh-loop': '^1.0.0', other: '^2.0.0' },
+      dsh: { profile: { bundles: ['dshmarket', 'dsh-loop'] } },
+    })
+    expect(dropFromManifest('web', 'dsh-loop')).toBe(true)
+    const manifest = JSON.parse(readFileSync(join(profileDir('web'), 'package.json'), 'utf8'))
+    expect(manifest.dependencies).toEqual({ other: '^2.0.0' })
+    expect(manifest.dsh.profile.bundles).toEqual(['dshmarket'])
+    expect(manifest.name).toBe('web')
+    expect(manifest.private).toBe(true)
+  })
+
+  it('returns false when the manifest never mentioned the package, and fails open when unreadable', () => {
+    writeProfile({ dependencies: { other: '^2.0.0' } })
+    expect(dropFromManifest('web', 'dsh-loop')).toBe(false)
+    expect(dropFromManifest('missing-profile', 'dsh-loop')).toBe(false)
   })
 })
 
@@ -72,6 +117,61 @@ describe('readInstalledManifest', () => {
       expect(readInstalledManifest('ignored', 'dsh-loop', explicitDir)).toBeNull()
     } finally {
       rmSync(explicitDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('readInstalledRepoEvidence (#141)', () => {
+  it('reads package.json repository metadata, including monorepo directories', () => {
+    const target = mkdtempSync(join(tmpdir(), 'dshm-link-'))
+    try {
+      writeProfile({ dependencies: { 'local-plugin': `link:${target}` } })
+      writeFileSync(join(target, 'package.json'), JSON.stringify({
+        name: 'local-plugin',
+        repository: {
+          type: 'git',
+          url: 'git+https://github.com/Owner/Repo.git',
+          directory: 'packages/local-plugin',
+        },
+      }))
+      expect(readInstalledRepoIdentities('web', 'local-plugin', `link:${target}`))
+        .toEqual(['owner/repo', 'owner/repo#path:/packages/local-plugin'])
+    } finally {
+      rmSync(target, { recursive: true, force: true })
+    }
+  })
+
+  it('falls back to the linked checkout origin and derives its subpath', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'dshm-repo-'))
+    const target = join(repo, 'packages', 'local-plugin')
+    try {
+      writeProfile({ dependencies: { 'local-plugin': `link:${target}` } })
+      mkdirSync(join(repo, '.git'), { recursive: true })
+      mkdirSync(target, { recursive: true })
+      writeFileSync(join(repo, '.git', 'config'), [
+        '[core]',
+        '\trepositoryformatversion = 0',
+        '[remote "origin"]',
+        '\turl = https://ghfast.top/https://github.com/GXX182/dsh-vision-bridge.git',
+      ].join('\n'))
+      writeFileSync(join(target, 'package.json'), JSON.stringify({ name: 'local-plugin' }))
+      expect(readInstalledRepoIdentities('web', 'local-plugin', `link:${target}`)).toEqual([])
+      expect(readInstalledRepoEvidence('web', 'local-plugin', `link:${target}`))
+        .toEqual({ identities: [], hints: ['gxx182/dsh-vision-bridge', 'gxx182/dsh-vision-bridge#path:/packages/local-plugin'] })
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('fails open when neither manifest nor Git metadata identifies the source', () => {
+    const target = mkdtempSync(join(tmpdir(), 'dshm-plain-'))
+    try {
+      writeProfile({ dependencies: { 'local-plugin': `file:${target}` } })
+      writeFileSync(join(target, 'package.json'), JSON.stringify({ name: 'local-plugin' }))
+      expect(readInstalledRepoIdentities('web', 'local-plugin', `file:${target}`)).toEqual([])
+      expect(readInstalledRepoIdentities('web', 'local-plugin', '^1.0.0')).toEqual([])
+    } finally {
+      rmSync(target, { recursive: true, force: true })
     }
   })
 })
@@ -116,6 +216,70 @@ describe('hasDshManifest / entryArtifactExists (#18 boot-brick guards)', () => {
     expect(entryArtifactExists(pkg)).toBe(false)
     writeFileSync(join(pkg, 'index.js'), '')
     expect(entryArtifactExists(pkg)).toBe(true)
+  })
+})
+
+describe('hasLoadableEntry — carrier bundles (#203)', () => {
+  /** A minimal loadable package: name only, index.js falls back and exists. */
+  function writeLoadable(dir: string): void {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), '{"name":"x"}')
+    writeFileSync(join(dir, 'index.js'), '')
+  }
+
+  it('finds a mount target hoisted to the workspace root, one level above the profile', () => {
+    // Reported shape exactly: a carrier (config-only, no entry of its own)
+    // whose cordis.patch.yml names an in-box package that pnpm hoisted to
+    // `<profiles>/node_modules` — one directory above `profiles/web` — because
+    // the profile is a workspace member. Neither of the two locations this
+    // function checked before #203 (the profile's own node_modules, and
+    // nested under the carrier) is that directory.
+    const profile = writeProfile({})
+    const carrier = join(profile, 'node_modules', 'dsh-ouroboros')
+    mkdirSync(carrier, { recursive: true })
+    writeFileSync(join(carrier, 'package.json'), '{"dsh":{"bundle":{"patch":"cordis.patch.yml"}}}')
+    writeFileSync(
+      join(carrier, 'cordis.patch.yml'),
+      "- name: '@deepseek-ai/dsh-mcp-client'\n  config: {}\n",
+    )
+    // Not present in the profile's own node_modules or nested under the
+    // carrier — a real in-box install lives one level up.
+    writeLoadable(join(dirname(profile), 'node_modules', '@deepseek-ai', 'dsh-mcp-client'))
+
+    expect(hasLoadableEntry(profile, 'dsh-ouroboros')).toBe(true)
+  })
+
+  it('still finds a target the profile itself installed, unaffected by the fix', () => {
+    const profile = writeProfile({})
+    const carrier = join(profile, 'node_modules', 'carrier')
+    mkdirSync(carrier, { recursive: true })
+    writeFileSync(join(carrier, 'package.json'), '{"dsh":{"bundle":{"patch":"cordis.patch.yml"}}}')
+    writeFileSync(join(carrier, 'cordis.patch.yml'), "- name: 'sibling-plugin'\n  config: {}\n")
+    writeLoadable(join(profile, 'node_modules', 'sibling-plugin'))
+
+    expect(hasLoadableEntry(profile, 'carrier')).toBe(true)
+  })
+
+  it('still finds a target nested under the carrier itself, unaffected by the fix', () => {
+    const profile = writeProfile({})
+    const carrier = join(profile, 'node_modules', 'carrier')
+    mkdirSync(carrier, { recursive: true })
+    writeFileSync(join(carrier, 'package.json'), '{"dsh":{"bundle":{"patch":"cordis.patch.yml"}}}')
+    writeFileSync(join(carrier, 'cordis.patch.yml'), "- name: 'nested-dep'\n  config: {}\n")
+    writeLoadable(join(carrier, 'node_modules', 'nested-dep'))
+
+    expect(hasLoadableEntry(profile, 'carrier')).toBe(true)
+  })
+
+  it('refuses a carrier whose target genuinely does not exist anywhere', () => {
+    const profile = writeProfile({})
+    const carrier = join(profile, 'node_modules', 'carrier')
+    mkdirSync(carrier, { recursive: true })
+    writeFileSync(join(carrier, 'package.json'), '{"dsh":{"bundle":{"patch":"cordis.patch.yml"}}}')
+    writeFileSync(join(carrier, 'cordis.patch.yml'), "- name: 'nowhere-to-be-found'\n  config: {}\n")
+    // Nothing written for the target in any of the three locations.
+
+    expect(hasLoadableEntry(profile, 'carrier')).toBe(false)
   })
 })
 
@@ -167,6 +331,29 @@ describe('manifest rollback (#65)', () => {
 })
 
 describe('setAllowBuilds (#6)', () => {
+  it('accepts the commit-pinned codeload key, and only in that exact shape (#285)', async () => {
+    // The allowlist is what stops a caller writing arbitrary text into a
+    // file pnpm parses. Widening it for pnpm <11.21 must not widen it into
+    // "anything containing a URL" — so the near-misses are asserted too.
+    const { setAllowBuilds } = await import('../src/profile.ts')
+    writeProfile({})
+    const sha = 'b0e6c57ebeeb4796017864f5cd5c66e6ba0899ec'
+    const approved = setAllowBuilds('web', [
+      `p@https://codeload.github.com/o/r/tar.gz/${sha}`,
+      // A different host wearing the same shape.
+      `p@https://evil.example.com/o/r/tar.gz/${sha}`,
+      // The right host with no commit pin: matches nothing, and an entry
+      // that matches nothing is indistinguishable from one that worked.
+      'p@https://codeload.github.com/o/r/tar.gz/HEAD',
+      // A path traversal dressed as a repo.
+      `p@https://codeload.github.com/../../etc/tar.gz/${sha}`,
+      // Something else entirely, smuggled through a newline.
+      `p@https://codeload.github.com/o/r/tar.gz/${sha}\n  evil: true`,
+    ])
+    expect(approved).toContain(`p@https://codeload.github.com/o/r/tar.gz/${sha}`)
+    expect(approved).toHaveLength(1)
+  })
+
   it('merges into an existing allowBuilds block and preserves the rest of the yaml', async () => {
     const { setAllowBuilds } = await import('../src/profile.ts')
     const dir = writeProfile({})
@@ -249,6 +436,45 @@ describe('setAllowBuilds (#6)', () => {
     setAllowBuilds('web', ['pkg-a'])
     expect(readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8')).toMatch(/packages:[\s\S]*allowBuilds:\n  pkg-a: true/)
   })
+
+  it('merges into a CRLF file instead of appending a second block (#231)', async () => {
+    // Every Windows editor, and git with core.autocrlf=true, writes CRLF.
+    // The old pattern required `allowBuilds:` to be followed immediately by
+    // \n, so it never saw the existing block and appended another — two
+    // top-level keys, invalid YAML, and pnpm then refused EVERY install in
+    // the profile, not just the one that triggered it.
+    const { setAllowBuilds } = await import('../src/profile.ts')
+    const dir = writeProfile({})
+    writeFileSync(join(dir, 'pnpm-workspace.yaml'),
+      'packages:\r\n  - .\r\n\r\nallowBuilds:\r\n  existing-pkg: true\r\n')
+    const approved = setAllowBuilds('web', ['ssh2'])
+    expect(approved).toContain('existing-pkg')
+    expect(approved).toContain('ssh2')
+    const yaml = readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8')
+    // Exactly one allowBuilds key — the whole point.
+    expect(yaml.match(/^allowBuilds:/gmu)?.length).toBe(1)
+    expect(yaml).toContain('existing-pkg: true')
+    expect(yaml).toContain('ssh2: true')
+    // ...and the file stays CRLF rather than becoming mixed.
+    expect(yaml).toContain('\r\n')
+    expect(/[^\r]\n/.test(yaml)).toBe(false)
+  })
+
+  it('repairs a profile already broken by the duplicate-block bug, keeping both blocks\' entries (#231)', async () => {
+    // What a Windows user's file looks like after the bug bit: the approval
+    // that triggered it went into a SECOND block. Merging is what repairs
+    // it — dropping the extra outright would silently revoke those entries.
+    const { setAllowBuilds } = await import('../src/profile.ts')
+    const dir = writeProfile({})
+    writeFileSync(join(dir, 'pnpm-workspace.yaml'),
+      'packages:\r\n  - .\r\n\r\nallowBuilds:\r\n  first-pkg: true\r\n'
+      + 'allowBuilds:\r\n  second-pkg: true\r\n')
+    const approved = setAllowBuilds('web', ['third-pkg'])
+    expect(approved).toEqual(expect.arrayContaining(['first-pkg', 'second-pkg', 'third-pkg']))
+    const yaml = readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8')
+    expect(yaml.match(/^allowBuilds:/gmu)?.length).toBe(1)
+    for (const pkg of ['first-pkg', 'second-pkg', 'third-pkg']) expect(yaml).toContain(`${pkg}: true`)
+  })
 })
 
 describe('conflictingEntryIds (#122)', () => {
@@ -287,5 +513,51 @@ describe('conflictingEntryIds (#122)', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('removeProfileBundle / addProfileBundle', () => {
+  function readBundles(dir: string): string[] {
+    const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+      dsh?: { profile?: { bundles?: string[] } }
+    }
+    return manifest.dsh?.profile?.bundles ?? []
+  }
+
+  it('drops a carrier bundle from dsh.profile.bundles, keeping the rest (#224)', () => {
+    const dir = writeProfile({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-postgres-backends', 'dshmarket'] } } })
+    expect(removeProfileBundle(dir, 'dsh-postgres-backends')).toBe(true)
+    expect(readBundles(dir)).toEqual(['@deepseek-ai/dsh-base', 'dshmarket'])
+  })
+
+  it('returns false and leaves the manifest byte-for-byte untouched when the bundle is absent', () => {
+    const dir = writeProfile({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } } })
+    const before = readFileSync(join(dir, 'package.json'), 'utf8')
+    expect(removeProfileBundle(dir, 'dsh-postgres-backends')).toBe(false)
+    expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(before)
+  })
+
+  it('re-adds a bundle on enable and is idempotent (#224)', () => {
+    const dir = writeProfile({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } } })
+    expect(addProfileBundle(dir, 'dsh-postgres-backends')).toBe(true)
+    expect(addProfileBundle(dir, 'dsh-postgres-backends')).toBe(false)
+    expect(readBundles(dir)).toEqual(['@deepseek-ai/dsh-base', 'dsh-postgres-backends'])
+  })
+
+  it('preserves unrelated manifest fields across a removal', () => {
+    const dir = writeProfile({
+      name: 'dsh-profile-web',
+      dependencies: { dshmarket: '^1.0.0' },
+      dsh: { profile: { bundles: ['dshmarket', 'dsh-postgres-backends'] } },
+    })
+    expect(removeProfileBundle(dir, 'dsh-postgres-backends')).toBe(true)
+    const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as {
+      name: string
+      dependencies: Record<string, string>
+      dsh: { profile: { bundles: string[] } }
+    }
+    expect(manifest.name).toBe('dsh-profile-web')
+    expect(manifest.dependencies).toEqual({ dshmarket: '^1.0.0' })
+    expect(manifest.dsh.profile.bundles).toEqual(['dshmarket'])
   })
 })

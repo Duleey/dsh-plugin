@@ -6,6 +6,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
+import { dirname } from 'node:path'
 import { Readable } from 'node:stream'
 
 const childProcess = vi.hoisted(() => ({ spawn: vi.fn() }))
@@ -66,6 +67,32 @@ describe('provisionPnpm (#149)', () => {
     expect(calls.some(call => call[0].startsWith('npm prefix'))).toBe(true)
   })
 
+  it('reaches the npm that ships beside the running Node when PATH has none (#167)', async () => {
+    // Reported from a desktop host on Windows: Node itself is RUNNING
+    // (v24.18.1 in the log), yet both `corepack` and `npm` come back
+    // "not recognized as an internal or external command" — the host spawns
+    // dsh without the Node install directory on PATH.
+    //
+    // npm and corepack live in that exact directory, and the Node binary
+    // (resolved the same way the market resolves it for its children) is the
+    // one path this process can always be sure of, so the setup has no
+    // business failing here.
+    const nodeDir = dirname((await import('../src/dsh-cli.ts')).nodeExecutable())
+    childProcess.spawn.mockImplementation((_file: string, _args: string[], options: { env?: Record<string, string> }) => {
+      // The whole toolchain is invisible unless Node's own directory is on
+      // the PATH handed to the child — exactly the reported machine. No
+      // output on the failing branch: `pnpm --version` is spawned with
+      // stdio 'ignore' and never reads its streams, so a fake that produces
+      // some would hang instead of failing.
+      const path = options.env?.PATH ?? ''
+      const separator = process.platform === 'win32' ? ';' : ':'
+      return fakeChild(path.split(separator).includes(nodeDir) ? 0 : 1)
+    })
+
+    const { provisionPnpm } = await import('../src/dsh-cli.ts')
+    await expect(provisionPnpm()).resolves.toEqual({ ok: true })
+  })
+
   it('still reports failure — with a hint — when pnpm genuinely cannot run', async () => {
     childProcess.spawn.mockImplementation((file: string, args: string[]) => {
       const command = commandOf(file, args)
@@ -78,6 +105,38 @@ describe('provisionPnpm (#149)', () => {
     const { provisionPnpm } = await import('../src/dsh-cli.ts')
     const result = await provisionPnpm()
     expect(result.ok).toBe(false)
-    expect(result.hint).toContain('找不到 Node')
+    // Names the toolchain, not "Node": #167's log has Node running at
+    // v24.18.1 while npm is what is missing, and a hint that blames the
+    // wrong thing sends the user to reinstall something they already have.
+    expect(result.hint).toContain('找不到 npm/corepack')
+  })
+
+  it('hints on a Windows console whose "not found" is unreadable bytes (#167)', async () => {
+    // Verbatim from the reported log: cmd.exe answers in the console's ANSI
+    // codepage, so what reaches us is mojibake — no `ENOENT`, no English,
+    // nothing to pattern-match. The reporter got an empty hint because of
+    // it. Resolution on disk is what has to carry the decision.
+    const garbled = "'npm' �����ڲ����ⲿ���Ҳ���ǿ����еĳ������������ļ���"
+    const { provisionHint } = await import('../src/dsh-cli.ts')
+    expect(provisionHint(garbled, garbled, false)).toContain('找不到 npm/corepack')
+    // ...and the same bytes with npm actually present must NOT claim it is
+    // missing, or every unrelated failure gets misfiled under this hint.
+    expect(provisionHint(garbled, garbled, true)).not.toContain('找不到 npm/corepack')
+  })
+
+  it('still says something when every step succeeded and pnpm runs anyway (#228)', async () => {
+    // The case that most needs an explanation used to get none: corepack and
+    // npm both exit 0, npm is on disk, and the install button stays locked.
+    // The reporter's complaint was precisely the silence — "又不告诉我怎么手动
+    // 配置". Returning undefined here is what produced that.
+    const { provisionHint } = await import('../src/dsh-cli.ts')
+    const hint = provisionHint('', 'changed 1 package in 491ms', true)
+    expect(hint).toBeDefined()
+    // The actionable question, not a restatement of the failure: where is
+    // pnpm, and is that anywhere this process looks?
+    expect(hint).toMatch(/which pnpm|where pnpm/)
+    expect(hint).toContain('PNPM_HOME')
+    // And it must not misfile itself as the npm-missing case.
+    expect(hint).not.toContain('找不到 npm/corepack')
   })
 })

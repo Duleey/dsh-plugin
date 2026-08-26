@@ -19,7 +19,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const registry = vi.hoisted(() => ({ loadRegistry: vi.fn() }))
-vi.mock('../src/registry.ts', () => ({ loadRegistry: registry.loadRegistry }))
+vi.mock('../src/registry.ts', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/registry.ts')>(),
+  loadRegistry: registry.loadRegistry,
+}))
 
 import { createThemeManager } from '../src/themes.ts'
 import type { ThemeHost } from '../src/themes.ts'
@@ -34,8 +37,6 @@ let home: string
 /** A catalog with one theme and one ordinary plugin, both GitHub-hosted. */
 function catalog(): void {
   registry.loadRegistry.mockResolvedValue({
-    source: 'snapshot',
-    registry: {
       updated: '2026-01-01',
       count: 2,
       categories: {},
@@ -50,8 +51,7 @@ function catalog(): void {
           url: 'https://github.com/someone/dsh-notify',
           description: { en: '', zh: '' }, install: '', added: '2026-01-01',
         },
-      ],
-    },
+    ],
   })
 }
 

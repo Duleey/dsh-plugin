@@ -52,8 +52,12 @@ describe.skipIf(!HAS_DSH)('web e2e: plugin market', () => {
   it('opens Settings → Plugin Market and renders the catalog paginated', async () => {
     await page.getByRole('button', { name: /^(设置|Settings)$/ }).first().click()
     await page.getByRole('button', { name: /插件市场|Plugin Market/ }).click()
-    await page.waitForSelector('[class*="grid"] [class*="card"]', { timeout: 30_000 })
-    const cards = await page.locator('[class*="grid"] [class*="card"]').count()
+    await page.waitForSelector('[class*="masonryCol"] > [class*="card"]', { timeout: 30_000 })
+    // Direct children only: a card with curated screenshots nests a
+    // `.cardShots`/`.cardShot` thumbnail strip, and both class names also
+    // match the loose `[class*="card"]` substring — counting descendants
+    // inflated the total by however many thumbnails were on screen.
+    const cards = await page.locator('[class*="masonryCol"] > [class*="card"]').count()
     // Pagination: a bounded first page (24) instead of the full 400+ catalog,
     // with a numbered pager underneath.
     expect(cards).toBe(24)
@@ -72,7 +76,7 @@ describe.skipIf(!HAS_DSH)('web e2e: plugin market', () => {
 
   it('search and category filter the grid', async () => {
     const search = page.getByPlaceholder(/搜索插件|Search plugins/)
-    const gridNames = () => page.locator('[class*="grid"] [class*="nm"]').allTextContents()
+    const gridNames = () => page.locator('[class*="masonryCol"] [class*="nm"]').allTextContents()
 
     const beforeSearch = await gridNames()
     await search.fill('memory')
@@ -85,31 +89,48 @@ describe.skipIf(!HAS_DSH)('web e2e: plugin market', () => {
     await search.fill('')
     await page.waitForTimeout(200)
 
-    // Category chips are data-driven; click the second chip (first is All).
-    // Same reasoning: a big category fills a whole page, so assert on the
-    // grid CONTENT changing rather than the count shrinking.
-    const beforeCats = await gridNames()
+    // Category chips are data-driven, and so was the assertion that used to
+    // live here: it compared the visible grid before and after, which holds
+    // only while the chosen category does not happen to own the top of the
+    // default sort. It stopped holding the day the live catalog grew past
+    // ~1300 entries, and both CI platforms went red on a change that touched
+    // none of this.
+    //
+    // The TOTAL PAGE COUNT is the property that actually defines filtering:
+    // narrowing to one category of several must leave fewer pages than "All",
+    // whatever today's catalog looks like and whichever chip is second.
+    const pages = async (): Promise<number> => {
+      const label = await page.locator('[class*="pageInfo"]').first().textContent()
+      // "第 3 / 56 页" / "Page 3 of 56" — the last number is the total.
+      const numbers = (label ?? '').match(/\d+/gu) ?? []
+      return Number(numbers[numbers.length - 1] ?? 0)
+    }
+
+    const allPages = await pages()
+    expect(allPages).toBeGreaterThan(1)
     const chips = page.locator('[class*="catsWrap"] [data-chip="1"]')
     await chips.nth(1).click()
     await page.waitForTimeout(400)
     const categorized = await gridNames()
     expect(categorized.length).toBeGreaterThanOrEqual(1)
-    expect(categorized).not.toEqual(beforeCats)
+    expect(await pages(), 'a category must hold fewer pages than the whole catalog').toBeLessThan(allPages)
     await chips.nth(0).click() // back to All
+    await page.waitForTimeout(400)
+    // ...and clearing the filter restores the full catalog, so a chip that
+    // silently stuck would not read as a pass.
+    expect(await pages()).toBe(allPages)
   })
 
-  it('the installed tab lists the market itself', async () => {
+  it('never lists the market itself in the Installed tab — it manages itself from its own settings card', async () => {
     await page.getByRole('button', { name: /已安装|Installed/ }).click()
-    await expect.poll(
-      async () => page.locator('[class*="irow"]', { hasText: 'dshmarket' }).count(),
-      { timeout: 15_000 },
-    ).toBeGreaterThanOrEqual(1)
+    await page.waitForTimeout(1000)
+    expect(await page.locator('[class*="irow"]', { hasText: 'dshmarket' }).count()).toBe(0)
   })
 
   it('the install dialog opens and cancels cleanly', async () => {
     // Independent of the previous test's final tab.
     await page.getByRole('button', { name: /^(发现|Discover)$/ }).click()
-    await page.waitForSelector('[class*="grid"] [class*="card"]', { timeout: 15_000 })
+    await page.waitForSelector('[class*="masonryCol"] [class*="card"]', { timeout: 15_000 })
     await page.getByRole('button', { name: /^(安装|Install)$/ }).first().click()
     const cancel = page.getByRole('button', { name: /^(取消|Cancel)$/ }).first()
     await cancel.waitFor({ timeout: 5000 })

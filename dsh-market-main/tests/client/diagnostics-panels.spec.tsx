@@ -1,13 +1,11 @@
 // @vitest-environment jsdom
 /**
- * Portable render tests for the issue #98 phase 2 Diagnostics panel: the
- * community-bundle ordering block (orderConflicts, drag & drop draft, Apply
- * order, auto-sort) and the AI-fix clipboard flow, plus the read-only
- * same-name rows. The host boundary is stubbed with a URL-routing fetch mock
- * (GET /dsh-market/check, POST /dsh-market/bundle-order) — no real profile,
- * no absolute machine paths, so this runs on any environment/CI. The phase 3
- * snapshots & rollback and plugin presets panels ship in later stacked PRs
- * and must NOT be present here.
+ * Portable render tests for the issue #98 phase 2/3 Diagnostics panels: the
+ * community-bundle ordering block (orderConflicts) and the collapsible
+ * snapshots & rollback panel (snapshot-panel.tsx). The host boundary is
+ * stubbed with a URL-routing fetch mock (GET /dsh-market/check, GET+POST
+ * /dsh-market/snapshots, POST /dsh-market/restore-snapshot) — no real
+ * profile, no absolute machine paths, so this runs on any environment/CI.
  */
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
@@ -52,8 +50,16 @@ const CHECK_REPORT = {
   orderConflicts: [
     { name: 'alpha', reason: 'must load after beta, but beta is currently before/equal (position 1 vs 0)' },
   ],
-  duplicateNames: [
-    { name: 'shared-name', layers: ['alpha', 'beta'], count: 2 },
+}
+
+/** Synthetic snapshot list payload (files entries are {path} objects). */
+const SNAPSHOTS = {
+  snapshots: [
+    {
+      id: 'snapshot-2025-01-01T00-00-00-000Z',
+      createdAt: 1780000000000,
+      files: [{ path: 'package.json' }, { path: 'cordis.patch.yml' }],
+    },
   ],
 }
 
@@ -65,12 +71,13 @@ interface ApiOverrides {
   check?: unknown
   /** Override the POST /dsh-market/bundle-order response (defaults to 200 ok). */
   bundleOrder?: { status?: number; body?: unknown }
+  snapshots?: unknown
 }
 
 /**
  * URL-routing fetch stub. Records every call so tests can assert request
- * shapes; GET /dsh-market/check returns the routed fixture, POST
- * /dsh-market/bundle-order answers { ok: true }.
+ * shapes; GETs return the routed fixture, POSTs answer { ok: true } (create /
+ * restore actions all succeed).
  */
 function stubApi(overrides: ApiOverrides = {}) {
   const mock = vi.fn((input: unknown, init?: RequestInit) => {
@@ -83,6 +90,13 @@ function stubApi(overrides: ApiOverrides = {}) {
         return Promise.resolve(new Response(JSON.stringify(resp.body), { status: resp.status ?? 200 }))
       }
       return Promise.resolve(json({ ok: true, bundles: ['@deepseek-ai/dsh-base', 'beta', 'alpha'] }))
+    }
+    if (url === '/dsh-market/snapshots') {
+      if (method === 'GET') return Promise.resolve(json(overrides.snapshots ?? SNAPSHOTS))
+      return Promise.resolve(json({ ok: true, snapshot: { id: 'snapshot-new', createdAt: 1780000000001, files: [] } }))
+    }
+    if (url === '/dsh-market/restore-snapshot') {
+      return Promise.resolve(json({ ok: true, restored: ['package.json'] }))
     }
     return Promise.resolve(json({ ok: true }))
   })
@@ -116,24 +130,83 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-describe('Diagnostics panels (jsdom, #98 phase 2)', () => {
-  it('renders ordering conflicts and same-name rows as read-only info', async () => {
-    const { mock } = stubApi()
-    render(<Diagnostics t={t} />)
-    await waitFor(() => expect(screen.queryByText(t('checkLoading'))).toBeNull())
-    expect(mock.mock.calls.length).toBe(1)
+describe('Diagnostics panels (jsdom, #98 phase 2/3)', () => {
+  it('keeps the snapshot section collapsed without fetching it', async () => {
+    const { mock } = await renderLoaded()
 
-    // Ordering-conflict rows render read-only: `name — reason`.
-    expect(screen.getByText(t('orderConflicts'))).toBeTruthy()
-    expect(screen.getByText(/^alpha — must load after beta/)).toBeTruthy()
+    // Only the check report is fetched on mount; the snapshot panel is lazy.
+    expect(mock.mock.calls.map(c => String(c[0]))).toEqual(['/dsh-market/check'])
 
-    // Same-name rows render in the neutral informational style (no ⚠).
-    expect(screen.getByText(t('duplicateNames'))).toBeTruthy()
-    expect(screen.getByText(/^shared-name × 2 — alpha \/ beta$/)).toBeTruthy()
+    const snapHead = screen.getByRole('button', { name: t('snapSection') })
+    expect(snapHead.getAttribute('aria-expanded')).toBe('false')
+  })
 
-    // The phase 3 snapshot/preset panels are NOT part of PR-B.
-    expect(screen.queryByRole('button', { name: t('snapSection') })).toBeNull()
-    expect(screen.queryByRole('button', { name: t('presetSection') })).toBeNull()
+  it('expanding the snapshot section fetches and renders the snapshot list', async () => {
+    const { mock, calls } = await renderLoaded()
+
+    fireEvent.click(screen.getByRole('button', { name: t('snapSection') }))
+    await waitFor(() => expect(calls('/dsh-market/snapshots').length).toBe(1))
+
+    const head = screen.getByRole('button', { name: t('snapSection') })
+    expect(head.getAttribute('aria-expanded')).toBe('true')
+
+    const section = sectionOf(t('snapSection'))
+    // Snapshot id + formatted time + captured files.
+    expect(within(section).getByText('snapshot-2025-01-01T00-00-00-000Z')).toBeTruthy()
+    expect(within(section).getByText(new Date(1780000000000).toLocaleString())).toBeTruthy()
+    expect(within(section).getByText(/package\.json, cordis\.patch\.yml/)).toBeTruthy()
+  })
+
+  it('creates a snapshot via POST /dsh-market/snapshots and reloads the list', async () => {
+    const { gets, posts } = await renderLoaded()
+    fireEvent.click(screen.getByRole('button', { name: t('snapSection') }))
+    await waitFor(() => expect(gets('/dsh-market/snapshots').length).toBe(1))
+
+    fireEvent.click(within(sectionOf(t('snapSection'))).getByRole('button', { name: t('snapCreate') }))
+    await waitFor(() => expect(posts('/dsh-market/snapshots').length).toBe(1))
+    expect(posts('/dsh-market/snapshots')[0]?.[1]?.body).toBe('{}')
+
+    await waitFor(() => expect(screen.getByText(t('snapCreated'))).toBeTruthy())
+    // The create succeeded → the list is reloaded (a second GET).
+    await waitFor(() => expect(gets('/dsh-market/snapshots').length).toBe(2))
+  })
+
+  it('restores a snapshot only after inline double confirmation, then refreshes the check report', async () => {
+    const { calls, posts } = await renderLoaded()
+    fireEvent.click(screen.getByRole('button', { name: t('snapSection') }))
+    const section = sectionOf(t('snapSection'))
+    await waitFor(() => expect(within(section).getByText('snapshot-2025-01-01T00-00-00-000Z')).toBeTruthy())
+
+    // First click arms the confirm state — no request yet.
+    fireEvent.click(within(section).getByRole('button', { name: t('snapRestore') }))
+    expect(within(section).getByText(t('snapRestoreConfirmText'))).toBeTruthy()
+    expect(posts('/dsh-market/restore-snapshot').length).toBe(0)
+
+    // Cancel leaves everything untouched.
+    fireEvent.click(within(section).getByRole('button', { name: t('cancel') }))
+    expect(within(section).queryByText(t('snapRestoreConfirmText'))).toBeNull()
+    expect(posts('/dsh-market/restore-snapshot').length).toBe(0)
+
+    // Arm again and confirm → POST restore-snapshot with the snapshot id.
+    fireEvent.click(within(section).getByRole('button', { name: t('snapRestore') }))
+    fireEvent.click(within(section).getByRole('button', { name: t('snapRestoreConfirm') }))
+    await waitFor(() => expect(posts('/dsh-market/restore-snapshot').length).toBe(1))
+    const post = posts('/dsh-market/restore-snapshot')[0]!
+    expect(JSON.parse(String(post[1]?.body))).toEqual({ snapshot: 'snapshot-2025-01-01T00-00-00-000Z' })
+
+    // Success triggers onRefresh → the check report is re-fetched.
+    await waitFor(() => expect(calls('/dsh-market/check').length).toBeGreaterThanOrEqual(2))
+  })
+
+  it('renders the ordering conflicts from the check report (name — reason)', async () => {
+    await renderLoaded()
+
+    const orderSection = screen.getByText(t('orderSection')).closest('section') as HTMLElement
+    expect(orderSection).toBeTruthy()
+    // Community bundle count in the section heading.
+    expect(within(orderSection).getByText('(2)')).toBeTruthy()
+    // Conflict row: name — reason.
+    expect(within(orderSection).getByText(/^alpha — must load after beta/)).toBeTruthy()
   })
 
   it('drag & drop reorders the local draft only; "Apply order" POSTs the new order', async () => {
@@ -253,6 +326,32 @@ describe('Diagnostics panels (jsdom, #98 phase 2)', () => {
     // The diff hint line: 1 override, 1 orphan, 1 duplicate.
     expect(screen.getByText(t('orderDiffHint').replace('{0}', '1').replace('{1}', '1').replace('{2}', '1'))).toBeTruthy()
   })
+  it('deletes a snapshot only after inline double confirmation', async () => {
+    const { posts } = await renderLoaded()
+    fireEvent.click(screen.getByRole('button', { name: t('snapSection') }))
+    const section = sectionOf(t('snapSection'))
+    await waitFor(() => expect(within(section).getByText('snapshot-2025-01-01T00-00-00-000Z')).toBeTruthy())
+
+    // First click arms the delete confirmation — no request yet.
+    fireEvent.click(within(section).getByRole('button', { name: t('snapDelete') }))
+    expect(within(section).getByText(t('snapDeleteConfirmText'))).toBeTruthy()
+    expect(posts('/dsh-market/delete-snapshot').length).toBe(0)
+
+    // Cancel leaves everything untouched.
+    fireEvent.click(within(section).getByRole('button', { name: t('cancel') }))
+    expect(within(section).queryByText(t('snapDeleteConfirmText'))).toBeNull()
+    expect(posts('/dsh-market/delete-snapshot').length).toBe(0)
+
+    // Arm again and confirm → POST delete-snapshot with the snapshot id.
+    fireEvent.click(within(section).getByRole('button', { name: t('snapDelete') }))
+    fireEvent.click(within(section).getByRole('button', { name: t('snapDeleteConfirm') }))
+    await waitFor(() => expect(posts('/dsh-market/delete-snapshot').length).toBe(1))
+    const post = posts('/dsh-market/delete-snapshot')[0]!
+    expect(JSON.parse(String(post[1]?.body))).toEqual({ snapshot: 'snapshot-2025-01-01T00-00-00-000Z' })
+
+    // Success reloads the snapshot list and shows the deleted message.
+    await waitFor(() => expect(within(section).getByText(t('snapDeleted'))).toBeTruthy())
+  })
 
   it('AI fix copies the diagnostics prompt to the clipboard and confirms', async () => {
     const writeText = vi.fn(() => Promise.resolve())
@@ -260,7 +359,7 @@ describe('Diagnostics panels (jsdom, #98 phase 2)', () => {
 
     // A HARD issue (duplicate entries) makes the AI-fix button visible —
     // purely informational reports keep it hidden (conservative UX).
-    stubApi({
+    const api = stubApi({
       check: { ...CHECK_REPORT, duplicates: [{ id: 'dup-entry', layers: ['alpha'], count: 2 }] },
     })
     render(<Diagnostics t={t} />)
@@ -276,13 +375,21 @@ describe('Diagnostics panels (jsdom, #98 phase 2)', () => {
     expect(prompt).toContain('alpha')
     expect(prompt).toContain('must load after beta')
     expect(prompt).toContain(t('aiFixConservative').slice(0, 20))
+    // The self-identification guard is present: the prompt tells the agent to
+    // detect whether it is itself the target harness, and to hard-forbid
+    // mutating / upgrade / restart / reinstall actions (plan-only output) when
+    // it is — the fix that prevents the harness from being killed mid-fix.
+    expect(prompt).toContain(t('aiFixDetect'))
+    expect(prompt).toContain(t('aiFixIfSelf'))
     await waitFor(() => expect(screen.getByText(t('aiFixCopied'))).toBeTruthy())
+    void api
   })
 
   it('AI-fix without a clipboard API shows the prompt in a copyable text block', async () => {
     // Regression for the #98 AI-fix fallback: when navigator.clipboard is
     // unavailable, the built prompt renders as a selectable <textarea> so the
-    // user can still copy it by hand.
+    // user can still copy it by hand. Diagnostics renders with the post-#98
+    // props signature (t only — the workspaces prop is gone).
     vi.stubGlobal('navigator', { ...navigator, clipboard: undefined })
     stubApi({
       check: { ...CHECK_REPORT, duplicates: [{ id: 'dup-entry', layers: ['alpha'], count: 2 }] },
@@ -322,6 +429,85 @@ describe('Diagnostics panels (jsdom, #98 phase 2)', () => {
     expect(textarea.value).toContain(t('aiFixConservative').slice(0, 20))
     // The clipboard path failed → no success toast.
     expect(screen.queryByText(t('aiFixCopied'))).toBeNull()
+  })
+
+  it('#201: peer warnings / info alone never show the AI-fix button', async () => {
+    // The old #125 gate treated ANY satisfied===false as a hard issue. #201
+    // tightens it: only a directional RISK opens the button; optional peers,
+    // aboveMax without an explicit bound, classifier `none` and legacy rows
+    // without a verdict stay in the warning/info tiers and stay quiet.
+    stubApi({
+      check: {
+        ...CHECK_REPORT,
+        orderConflicts: [],
+        peerMismatches: [
+          {
+            plugin: 'plugin-warn', name: '@deepseek-ai/dsh-llm', range: '^0.1.0',
+            resolved: '0.2.0', satisfied: false, optional: false,
+            verdict: { kind: 'warning', warning: { plugin: 'plugin-warn', peer: '@deepseek-ai/dsh-llm', range: '^0.1.0', resolved: '0.2.0', reason: 'aboveMax' } },
+          },
+          {
+            plugin: 'plugin-opt', name: '@deepseek-ai/cordis', range: '^4.0.1',
+            resolved: '4.0.1', satisfied: false, optional: true,
+            verdict: { kind: 'warning', warning: { plugin: 'plugin-opt', peer: '@deepseek-ai/cordis', range: '^4.0.1', resolved: '4.0.1', reason: 'optional' } },
+          },
+          { plugin: 'legacy-row', name: '@deepseek-ai/dsh-session', range: '^0.1.0', resolved: '0.2.0', satisfied: false, optional: false },
+        ],
+        summary: {
+          ok: true,
+          errors: [],
+          warnings: ['plugin-warn peer range @deepseek-ai/dsh-llm@^0.1.0 does not match resolved 0.2.0'],
+        },
+      },
+    })
+    render(<Diagnostics t={t} />)
+    await waitFor(() => expect(screen.queryByText(t('checkLoading'))).toBeNull())
+
+    expect(screen.queryByRole('button', { name: t('aiFix') })).toBeNull()
+    expect(screen.getByText(new RegExp(`^${t('catRisk')}:\\s*0$`))).toBeTruthy()
+    expect(screen.getByText(new RegExp(`^${t('catWarn')}:\\s*3$`))).toBeTruthy()
+  })
+
+  it('#201: a risk peer opens AI fix and the prompt carries the risk row, not summary.warnings', async () => {
+    const writeText = vi.fn(() => Promise.resolve())
+    vi.stubGlobal('navigator', { ...navigator, clipboard: { writeText } })
+    stubApi({
+      check: {
+        ...CHECK_REPORT,
+        orderConflicts: [],
+        peerMismatches: [
+          {
+            plugin: 'plugin-risk', name: '@deepseek-ai/dsh-settings', range: '^0.1.0-rc.7',
+            resolved: '0.1.0-rc.6', satisfied: false, optional: false,
+            verdict: {
+              kind: 'risk',
+              risk: { plugin: 'plugin-risk', peer: '@deepseek-ai/dsh-settings', range: '^0.1.0-rc.7', resolved: '0.1.0-rc.6', direction: 'belowMin' },
+            },
+          },
+        ],
+        summary: {
+          ok: true,
+          errors: [],
+          warnings: [
+            'plugin-risk peer range @deepseek-ai/dsh-settings@^0.1.0-rc.7 does not match resolved 0.1.0-rc.6',
+            'noise-warning that must not reach the agent prompt',
+          ],
+        },
+      },
+    })
+    render(<Diagnostics t={t} />)
+    await waitFor(() => expect(screen.queryByText(t('checkLoading'))).toBeNull())
+
+    fireEvent.click(screen.getByRole('button', { name: t('aiFix') }))
+    await waitFor(() => expect(writeText).toHaveBeenCalled())
+    const prompt = String(writeText.mock.calls[0]?.[0])
+    expect(prompt).toContain('/synthetic/profiles/web')
+    expect(prompt).toContain('@deepseek-ai/dsh-settings')
+    expect(prompt).toContain('^0.1.0-rc.7')
+    expect(prompt).toContain(t('peerRiskBelowMin'))
+    // The structured prompt no longer dumps summary.warnings.
+    expect(prompt).not.toContain('noise-warning')
+    expect(prompt).not.toContain('does not match resolved')
   })
 
   it('AI-fix works without the removed workspaces prop (clipboard-only contract)', async () => {

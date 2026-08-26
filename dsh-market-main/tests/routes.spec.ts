@@ -4,16 +4,18 @@
  * plus a temp profile fixture, then drives the captured handlers with fake
  * IncomingMessage / ServerResponse objects. No server socket, no pnpm, no
  * network — the same surface the real harness host provides, so the method /
- * Allow, origin, body-validation, 422 and write-lock contracts of the new
+ * Allow, origin, body-validation, 422 and write-lock contracts of the 5 new
  * routes are pinned without spawning a process.
  *
- * The new routes (vs. the PR-A branch base): /dsh-market/check (PR-A) and
- * /dsh-market/bundle-order (PR-B). The snapshots & presets routes ship in
- * later stacked PRs.
+ * The 6 routes covered here: /dsh-market/check, /bundle-order, /snapshots,
+ * /restore-snapshot, /delete-snapshot and /presets. Presets have no import
+ * or export of their own — Backup & Restore already carries a profile off
+ * the machine, and a second export in another tab would only make the user
+ * choose between two overlapping file formats.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -137,9 +139,9 @@ function post(path: string, body: unknown): RequestOpts {
 
 /**
  * A request whose body stream never ends until `finish()` is called. Used to
- * hold the direct-write lock deterministically: bundle-order acquires the
- * lock BEFORE awaiting the body, so a pending body keeps `writing` true until
- * the test releases it.
+ * hold the direct-write lock deterministically: restore-snapshot /
+ * delete-snapshot acquire the lock BEFORE awaiting the body,
+ * so a pending body keeps `writing` true until the test releases it.
  */
 function makePendingRequest(path: string): { request: IncomingMessage; finish: () => void } {
   let finish!: () => void
@@ -217,10 +219,14 @@ function writeStandardProfile(): void {
 
 // --- tests ------------------------------------------------------------------
 
-describe('method & Allow contract (new routes)', () => {
+describe('method & Allow contract (6 new routes)', () => {
   it.each([
     ['/dsh-market/check', 'POST', 'GET'],
     ['/dsh-market/bundle-order', 'GET', 'POST'],
+    ['/dsh-market/snapshots', 'DELETE', 'GET, POST'],
+    ['/dsh-market/restore-snapshot', 'GET', 'POST'],
+    ['/dsh-market/delete-snapshot', 'GET', 'POST'],
+    ['/dsh-market/presets', 'DELETE', 'GET, POST'],
   ])('answers 405 with an Allow header on %s', async (path, method, allow) => {
     const res = await hit(routes, path as string, { method: method as string, url: path as string })
     expect(res.status).toBe(405)
@@ -231,6 +237,10 @@ describe('method & Allow contract (new routes)', () => {
 describe('origin enforcement (mutating routes)', () => {
   const mutating: Array<[string, unknown]> = [
     ['/dsh-market/bundle-order', { order: ['beta', 'alpha'] }],
+    ['/dsh-market/snapshots', undefined],
+    ['/dsh-market/restore-snapshot', { snapshot: 'snapshot-x' }],
+    ['/dsh-market/delete-snapshot', { snapshot: 'snapshot-x' }],
+    ['/dsh-market/presets', { action: 'save', name: 'p' }],
   ]
 
   it.each(mutating)('rejects a cross-origin POST %s with 403', async (path, body) => {
@@ -277,6 +287,49 @@ describe('body validation — 400 contracts', () => {
     // …while a non-permutation STRING array is refused by the trial gate (422).
     const incomplete = await hit(routes, '/dsh-market/bundle-order', post('/dsh-market/bundle-order', { order: ['alpha'] }))
     expect(incomplete.status).toBe(422)
+  })
+
+  it('restore-snapshot refuses a missing / empty / non-string snapshot id', async () => {
+    const cases: Array<[unknown, RegExp]> = [
+      [null, /snapshot id is required/],
+      [{}, /snapshot id is required/],
+      [{ snapshot: '' }, /snapshot id is required/],
+      [{ snapshot: 42 }, /snapshot id is required/],
+    ]
+    for (const [body, pattern] of cases) {
+      const res = await hit(routes, '/dsh-market/restore-snapshot', post('/dsh-market/restore-snapshot', body))
+      expect(res.status, `body ${JSON.stringify(body)}`).toBe(400)
+      expect(String(jsonBody(res).error)).toMatch(pattern)
+    }
+  })
+
+  it('presets refuses a null body, a missing action and an unknown action', async () => {
+    const nullBody = await hit(routes, '/dsh-market/presets', post('/dsh-market/presets', null))
+    expect(nullBody.status).toBe(400)
+    const noAction = await hit(routes, '/dsh-market/presets', post('/dsh-market/presets', {}))
+    expect(noAction.status).toBe(400)
+    const badAction = await hit(routes, '/dsh-market/presets', post('/dsh-market/presets', { action: 'explode' }))
+    expect(badAction.status).toBe(400)
+    expect(String(jsonBody(badAction).error)).toMatch(/save \| preview \| apply \| delete/)
+  })
+
+  it('previewing a preset that does not exist is 422, not a 500', async () => {
+    const res = await hit(routes, '/dsh-market/presets', post('/dsh-market/presets', { action: 'preview', name: 'ghost' }))
+    expect(res.status).toBe(422)
+    expect(jsonBody(res)).toMatchObject({ ok: false })
+  })
+
+  it('delete-snapshot refuses a missing id and a traversal-shaped id', async () => {
+    const missing = await hit(routes, '/dsh-market/delete-snapshot', post('/dsh-market/delete-snapshot', {}))
+    expect(missing.status).toBe(400)
+    // The traversal-shaped id passes the route's string check but is refused
+    // by deleteSnapshot's id validation BEFORE touching the filesystem — the
+    // route reports it as a plain not-found (ok:false, 400).
+    const traversal = await hit(routes, '/dsh-market/delete-snapshot', post('/dsh-market/delete-snapshot', { snapshot: '../escape' }))
+    expect(traversal.status).toBe(400)
+    expect(jsonBody(traversal)).toMatchObject({ ok: false, error: 'snapshot not found / 快照不存在' })
+    const traversal2 = await hit(routes, '/dsh-market/delete-snapshot', post('/dsh-market/delete-snapshot', { snapshot: 'snapshot-../../etc/passwd' }))
+    expect(traversal2.status).toBe(400)
   })
 
   it('an unparseable byte stream is refused without touching the profile (500 — parse error)', async () => {
@@ -332,6 +385,56 @@ describe('GET /dsh-market/check — report contract', () => {
     expect(report.summary).toEqual({ ok: true, errors: [], warnings: [] })
   })
 
+  it('#201: attaches optional + classifyPeer verdict to every peer row', async () => {
+    writeProfile(['@deepseek-ai/dsh-base', 'alpha'])
+    writeBundle('@deepseek-ai/dsh-base')
+    writeBundle('alpha')
+    // alpha declares three peers: a belowMin risk, an optional mismatch and
+    // one that cannot be resolved from anywhere (host-only package, absent).
+    const alphaDir = join(dir, 'node_modules', 'alpha')
+    writeFileSync(join(alphaDir, 'package.json'), JSON.stringify({
+      name: 'alpha', version: '1.0.0', dsh: { bundle: { patch: './cordis.patch.yml' } },
+      peerDependencies: {
+        '@deepseek-ai/dsh-tools': '^0.1.0-rc.7',
+        '@deepseek-ai/cordis': '^4.0.2',
+        '@deepseek-ai/absent-host-only': '^0.1.0',
+      },
+      peerDependenciesMeta: {
+        '@deepseek-ai/cordis': { optional: true },
+      },
+    }, null, 2))
+    const writeResolved = (name: string, version: string) => {
+      const pkgDir = join(dir, 'node_modules', name)
+      mkdirSync(pkgDir, { recursive: true })
+      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name, version }, null, 2))
+    }
+    writeResolved('@deepseek-ai/dsh-tools', '0.1.0-rc.6')
+    writeResolved('@deepseek-ai/cordis', '4.0.1')
+
+    const res = await hit(routes, '/dsh-market/check', { method: 'GET', url: '/dsh-market/check' })
+    expect(res.status).toBe(200)
+    const report = res.json() as {
+      peerMismatches: Array<{
+        plugin: string; name: string; resolved: string | null; satisfied: boolean | null
+        optional?: boolean
+        verdict: { kind: string; risk?: { direction: string }; warning?: { reason: string } }
+      }>
+    }
+    expect(report.peerMismatches).toHaveLength(3)
+    const risk = report.peerMismatches.find(row => row.name === '@deepseek-ai/dsh-tools')
+    // `optional` is OMITTED rather than false on a row the plugin did not
+    // mark (#275), so absence is the assertion — the verdict beside it is
+    // what proves the row was classified as non-optional and not skipped.
+    expect(risk?.optional).toBeUndefined()
+    expect(risk?.verdict).toMatchObject({ kind: 'risk', risk: { direction: 'belowMin' } })
+    const optional = report.peerMismatches.find(row => row.name === '@deepseek-ai/cordis')
+    expect(optional?.optional).toBe(true)
+    expect(optional?.verdict).toMatchObject({ kind: 'warning', warning: { reason: 'optional' } })
+    const absent = report.peerMismatches.find(row => row.name === '@deepseek-ai/absent-host-only')
+    expect(absent?.satisfied).toBeNull()
+    expect(absent?.verdict).toMatchObject({ kind: 'none' })
+  })
+
   it('reports bundle-order rule violations in orderConflicts', async () => {
     writeProfile(['@deepseek-ai/dsh-base', 'alpha', 'beta'])
     writeBundle('@deepseek-ai/dsh-base')
@@ -348,8 +451,32 @@ describe('GET /dsh-market/check — report contract', () => {
   })
 })
 
+describe('GET /dsh-market/installed — local repository evidence', () => {
+  it('returns package repository identities without changing the installed map', async () => {
+    const target = join(tmp, 'dsh-vision-bridge')
+    mkdirSync(target, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ dependencies: {
+      'dsh-vision-bridge': `link:${target}`,
+    } }))
+    writeFileSync(join(target, 'package.json'), JSON.stringify({
+      name: 'dsh-vision-bridge',
+      repository: 'github:GXX182/dsh-vision-bridge',
+    }))
+
+    const res = await hit(routes, '/dsh-market/installed', { method: 'GET', url: '/dsh-market/installed' })
+    expect(res.status).toBe(200)
+    expect(jsonBody(res)).toMatchObject({
+      installed: { 'dsh-vision-bridge': `link:${target}` },
+      repoIdentities: { 'dsh-vision-bridge': ['gxx182/dsh-vision-bridge'] },
+      repoHints: {},
+    })
+  })
+})
+
 describe('POST /dsh-market/bundle-order', () => {
   it('applies a valid community reorder: 200 with the merged stack, manifest rewritten', async () => {
+    // #125/#126: the in-route pre-write safety net is the profile backup, and
+    // a persistent snapshot is auto-created before the write (issue #126).
     writeStandardProfile()
     const res = await hit(routes, '/dsh-market/bundle-order', post('/dsh-market/bundle-order', { order: ['beta', 'alpha'] }))
     expect(res.status).toBe(200)
@@ -359,6 +486,25 @@ describe('POST /dsh-market/bundle-order', () => {
 
     const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { dsh: { profile: { bundles: string[] } } }
     expect(manifest.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', 'beta', 'alpha'])
+  })
+
+  it('persists a profile snapshot BEFORE the write (issue #126: recoverable reorder)', async () => {
+    writeStandardProfile()
+    const res = await hit(routes, '/dsh-market/bundle-order', post('/dsh-market/bundle-order', { order: ['beta', 'alpha'] }))
+    expect(res.status).toBe(200)
+    const body = jsonBody(res)
+    expect(body.ok).toBe(true)
+    // The response carries the pre-write snapshot id.
+    expect(typeof body.snapshot).toBe('string')
+    expect(String(body.snapshot)).toMatch(/^snapshot-/)
+    // The snapshot was persisted BEFORE the write: it captures the ORIGINAL
+    // order [alpha, beta], so restoring it reverts the reorder.
+    const snapDir = join(dir, '.dsh-market', 'snapshots')
+    const snapFiles = readdirSync(snapDir).filter(f => f.endsWith('.json'))
+    expect(snapFiles).toHaveLength(1)
+    const snap = JSON.parse(readFileSync(join(snapDir, snapFiles[0]!), 'utf8')) as { files: Array<{ path: string; json: { dsh?: { profile?: { bundles?: string[] } } } }> }
+    const manifestJson = snap.files.find(f => f.path === 'package.json')
+    expect(manifestJson?.json.dsh?.profile?.bundles).toEqual(['@deepseek-ai/dsh-base', 'alpha', 'beta'])
   })
 
   it('refuses a rule-violating order with 422 + conflicts', async () => {
@@ -373,8 +519,9 @@ describe('POST /dsh-market/bundle-order', () => {
     const body = jsonBody(res)
     expect(String(body.error)).toMatch(/violates declared before\/after rules/)
     expect(Array.isArray(body.conflicts)).toBe(true)
-    // Refused BEFORE the write: manifest untouched.
+    // Refused BEFORE the write: manifest and snapshot dir untouched.
     expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(before)
+    expect(existsSync(join(dir, '.dsh-market', 'snapshots'))).toBe(false)
   })
 
   it('refuses an order that would not boot with 422 + trial errors', async () => {
@@ -396,29 +543,31 @@ describe('POST /dsh-market/bundle-order', () => {
 
   it('answers 409 while another write holds the direct-write lock, then succeeds after release', async () => {
     writeStandardProfile()
-    // bundle-order takes the lock BEFORE reading the body — a pending body
+    // restore-snapshot takes the lock BEFORE reading the body — a pending body
     // pins `writing` until the test releases it.
-    const pending = makePendingRequest('/dsh-market/bundle-order')
-    const inflight = routes.get('/dsh-market/bundle-order')!
+    const pending = makePendingRequest('/dsh-market/restore-snapshot')
+    const inflight = routes.get('/dsh-market/restore-snapshot')!
     const captured = makeResponse()
     const pendingRun = inflight(pending.request, captured.response)
 
     // Synchronous up to the first await → the lock is already held.
-    const concurrent = await hit(routes, '/dsh-market/bundle-order', post('/dsh-market/bundle-order', { order: ['beta', 'alpha'] }))
-    expect(concurrent.status).toBe(409)
-    expect(jsonBody(concurrent)).toEqual({ error: 'another plugin operation is running' })
+    const snap = await hit(routes, '/dsh-market/snapshots', post('/dsh-market/snapshots', undefined))
+    expect(snap.status).toBe(409)
+    expect(jsonBody(snap)).toEqual({ error: 'another plugin operation is running' })
+
+    const order = await hit(routes, '/dsh-market/bundle-order', post('/dsh-market/bundle-order', { order: ['beta', 'alpha'] }))
+    expect(order.status).toBe(409)
 
     // The update route gained the same `writing` guard (issue #98 analysis).
     const upd = await hit(routes, '/dsh-market/update', post('/dsh-market/update', { name: 'alpha' }))
     expect(upd.status).toBe(409)
 
-    // Release the lock → the pending request completes with its '{}' body,
-    // which is missing the order → 400.
+    // Release the lock → the same write succeeds.
     pending.finish()
     await pendingRun
-    expect(captured.captured().status).toBe(400)
+    expect(captured.captured().status).toBe(400) // the released body {} → missing snapshot id
 
-    const after = await hit(routes, '/dsh-market/bundle-order', post('/dsh-market/bundle-order', { order: ['beta', 'alpha'] }))
+    const after = await hit(routes, '/dsh-market/snapshots', post('/dsh-market/snapshots', undefined))
     expect(after.status).toBe(200)
   })
 
@@ -438,9 +587,12 @@ describe('POST /dsh-market/bundle-order', () => {
     void uninstallRun
     await tick() // flush the microtasks up to the hanging runPlugin
 
+    const snap = await hit(routes, '/dsh-market/snapshots', post('/dsh-market/snapshots', undefined))
+    expect(snap.status).toBe(409)
+    expect(jsonBody(snap)).toEqual({ error: 'another plugin operation is running' })
+
     const order = await hit(routes, '/dsh-market/bundle-order', post('/dsh-market/bundle-order', { order: ['beta', 'alpha'] }))
     expect(order.status).toBe(409)
-    expect(jsonBody(order)).toEqual({ error: 'another plugin operation is running' })
 
     // update distinguishes the two locks in its message.
     const upd = await hit(routes, '/dsh-market/update', post('/dsh-market/update', { name: 'alpha' }))
@@ -505,5 +657,73 @@ describe('sameOrigin', () => {
     for (const origin of ['not a url', '://', 'http://', '']) {
       expect(sameOrigin(req({ host: '127.0.0.1:3080', origin })), origin).toBe(false)
     }
+  })
+})
+describe('GET/POST /dsh-market/snapshots', () => {
+  it('lists an empty snapshot set, creates one, lists it again', async () => {
+    writeStandardProfile()
+    const empty = await hit(routes, '/dsh-market/snapshots', { method: 'GET', url: '/dsh-market/snapshots' })
+    expect(empty.status).toBe(200)
+    expect(jsonBody(empty)).toEqual({ snapshots: [] })
+
+    const created = await hit(routes, '/dsh-market/snapshots', post('/dsh-market/snapshots', undefined))
+    expect(created.status).toBe(200)
+    const body = jsonBody(created)
+    expect(body.ok).toBe(true)
+    const snapshot = (body.snapshot ?? {}) as { id: string; createdAt: number; files: unknown[] }
+    expect(snapshot.id).toMatch(/^snapshot-/)
+    expect(typeof snapshot.createdAt).toBe('number')
+    expect(snapshot.files.map((f: { path: string }) => f.path)).toEqual(['package.json'])
+
+    const listed = await hit(routes, '/dsh-market/snapshots', { method: 'GET', url: '/dsh-market/snapshots' })
+    expect((jsonBody(listed).snapshots as unknown[]).length).toBe(1)
+  })
+
+  it('answers 400 when the profile has no package.json', async () => {
+    // No fixture at all: createProfileSnapshot cannot snapshot a manifest-less dir.
+    const res = await hit(routes, '/dsh-market/snapshots', post('/dsh-market/snapshots', undefined))
+    expect(res.status).toBe(400)
+    expect(String(jsonBody(res).error)).toMatch(/package\.json is missing/)
+  })
+})
+
+describe('POST /dsh-market/restore-snapshot & /dsh-market/delete-snapshot', () => {
+  it('round-trips: create → corrupt the order → restore → delete', async () => {
+    writeStandardProfile()
+    const created = await hit(routes, '/dsh-market/snapshots', post('/dsh-market/snapshots', undefined))
+    const id = (jsonBody(created).snapshot as { id: string }).id
+
+    // Corrupt the manifest (swap the community order by hand).
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name: 'web-profile',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'beta', 'alpha'] } },
+    }, null, 2))
+
+    const restored = await hit(routes, '/dsh-market/restore-snapshot', post('/dsh-market/restore-snapshot', { snapshot: id }))
+    expect(restored.status).toBe(200)
+    const restoredBody = jsonBody(restored)
+    expect(restoredBody.ok).toBe(true)
+    expect(restoredBody.restored).toContain('package.json')
+    const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { dsh: { profile: { bundles: string[] } } }
+    expect(manifest.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base', 'alpha', 'beta'])
+
+    const deleted = await hit(routes, '/dsh-market/delete-snapshot', post('/dsh-market/delete-snapshot', { snapshot: id }))
+    expect(deleted.status).toBe(200)
+    expect(jsonBody(deleted)).toMatchObject({ ok: true, snapshot: id })
+
+    const listed = await hit(routes, '/dsh-market/snapshots', { method: 'GET', url: '/dsh-market/snapshots' })
+    expect(jsonBody(listed)).toEqual({ snapshots: [] })
+  })
+
+  it('restore of an unknown snapshot answers 400', async () => {
+    const res = await hit(routes, '/dsh-market/restore-snapshot', post('/dsh-market/restore-snapshot', { snapshot: 'snapshot-does-not-exist' }))
+    expect(res.status).toBe(400)
+    expect(String(jsonBody(res).error)).toMatch(/snapshot not found/)
+  })
+
+  it('delete of an unknown snapshot answers 400', async () => {
+    const res = await hit(routes, '/dsh-market/delete-snapshot', post('/dsh-market/delete-snapshot', { snapshot: 'snapshot-does-not-exist' }))
+    expect(res.status).toBe(400)
+    expect(String(jsonBody(res).error)).toMatch(/snapshot not found/)
   })
 })

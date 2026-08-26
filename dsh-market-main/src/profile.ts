@@ -4,9 +4,28 @@
  * functions of the directory contents; no processes, no network.
  */
 
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { githubRemoteIdentities, githubRepoIdentities } from './sources.ts'
+
+/**
+ * Whether a profile name follows DSH's own directory-name contract.
+ *
+ * Keep this aligned with `@deepseek-ai/dsh-app-boot`'s
+ * `resolveProfileDir`: dots, spaces, and Unicode are ordinary name
+ * characters; only empty, traversal-shaped, launcher-owned, or
+ * separator-bearing names are refused.
+ */
+export function isDshProfileName(profile: string): boolean {
+  return profile !== ''
+    && profile !== '.'
+    && profile !== '..'
+    && profile !== 'node_modules'
+    && !profile.includes('/')
+    && !profile.includes('\\')
+    && !profile.includes('\0')
+}
 
 /**
  * Resolve a profile name to its directory under DSH_HOME (default ~/.dsh).
@@ -15,6 +34,7 @@ import { join } from 'node:path'
  */
 export function profileDir(profile: string, explicitDir?: string): string {
   if (explicitDir !== undefined) return explicitDir
+  if (!isDshProfileName(profile)) throw new Error(`dsh-market: invalid profile name ${JSON.stringify(profile)}`)
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
   return join(home, 'profiles', profile)
 }
@@ -93,6 +113,45 @@ export function restoreManifestDeps(profile: string, snapshot: Record<string, st
   return [...touched]
 }
 
+/**
+ * Remove a package from BOTH manifest lists — dependencies and
+ * dsh.profile.bundles. The uninstall counterpart of restoreManifestDeps:
+ * pnpm can fail a remove after deleting node_modules but before saving
+ * package.json (the #65 write-order's mirror image — a file locked mid-
+ * unlink aborts the run), leaving the manifest pointing at a package that
+ * no longer exists on disk. The next boot then fails to activate the ghost
+ * dependency. When disk truth says the package is gone, this finishes the
+ * removal the CLI could not. Every other manifest field is untouched.
+ *
+ * Written atomically, unlike restoreManifestDeps above. This one runs only
+ * after something already went wrong mid-uninstall, so it is the worst place
+ * in the codebase to leave a half-written package.json: the profile would go
+ * from "one ghost dependency" to "will not parse".
+ * @returns true when either list still mentioned the package.
+ */
+export function dropFromManifest(profile: string, name: string, explicitDir?: string): boolean {
+  const file = join(profileDir(profile, explicitDir), 'package.json')
+  let manifest: { dependencies?: Record<string, string>; dsh?: { profile?: { bundles?: string[] } } }
+  try {
+    manifest = JSON.parse(readFileSync(file, 'utf8')) as typeof manifest
+  } catch {
+    return false
+  }
+  let touched = false
+  if (manifest.dependencies !== undefined && manifest.dependencies[name] !== undefined) {
+    delete manifest.dependencies[name]
+    touched = true
+  }
+  const bundles = manifest.dsh?.profile?.bundles
+  if (Array.isArray(bundles) && bundles.includes(name)) {
+    manifest.dsh!.profile!.bundles = bundles.filter(bundle => bundle !== name)
+    touched = true
+  }
+  if (!touched) return false
+  writeManifestAtomic(file, manifest)
+  return true
+}
+
 /** The version actually present in the profile's node_modules, or null. */
 export function readInstalledVersion(profile: string, name: string, explicitDir?: string): string | null {
   try {
@@ -114,6 +173,166 @@ export function readInstalledManifest(profile: string, name: string, explicitDir
   } catch {
     return null
   }
+}
+
+const PACKAGE_NAME_RE = /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i
+
+function localSpecDirectory(root: string, spec: string): string | null {
+  const match = /^(?:link|file):(.+)$/i.exec(spec)
+  if (match === null) return null
+  let path = match[1]!
+  try { path = decodeURIComponent(path) } catch { /* keep the literal pnpm path */ }
+  // file:// URLs are uncommon in profile manifests; reject them rather than
+  // guessing across platforms. Normal pnpm link:/file: directory specs reach
+  // this code as absolute or profile-relative filesystem paths.
+  if (path.startsWith('//')) return null
+  const candidate = isAbsolute(path) ? path : resolve(root, path)
+  try {
+    return statSync(candidate).isDirectory() ? realpathSync(candidate) : null
+  } catch {
+    return null
+  }
+}
+
+function installedPackageDirectory(root: string, name: string): string | null {
+  try {
+    const candidate = join(root, 'node_modules', name)
+    return statSync(candidate).isDirectory() ? realpathSync(candidate) : null
+  } catch {
+    return null
+  }
+}
+
+function manifestAt(dir: string): Record<string, unknown> | null {
+  try {
+    const value = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as unknown
+    return typeof value === 'object' && value !== null ? value as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function manifestRepository(manifest: Record<string, unknown> | null): { url: string; directory: string | null } | null {
+  const repository = manifest?.repository
+  if (typeof repository === 'string') return { url: repository, directory: null }
+  if (typeof repository !== 'object' || repository === null) return null
+  const value = repository as Record<string, unknown>
+  if (typeof value.url !== 'string') return null
+  return { url: value.url, directory: typeof value.directory === 'string' ? value.directory : null }
+}
+
+function gitConfigPath(marker: string, worktreeRoot: string): string | null {
+  try {
+    if (statSync(marker).isDirectory()) {
+      const direct = join(marker, 'config')
+      return existsSync(direct) ? direct : null
+    }
+    const pointer = /^gitdir:\s*(.+)$/im.exec(readFileSync(marker, 'utf8'))
+    if (pointer === null) return null
+    const gitDir = resolve(worktreeRoot, pointer[1]!.trim())
+    const direct = join(gitDir, 'config')
+    if (existsSync(direct)) return direct
+    const commonDir = readFileSync(join(gitDir, 'commondir'), 'utf8').trim()
+    const common = join(resolve(gitDir, commonDir), 'config')
+    return existsSync(common) ? common : null
+  } catch {
+    return null
+  }
+}
+
+function originFromConfig(file: string): string | null {
+  try {
+    let origin = false
+    for (const line of readFileSync(file, 'utf8').split(/\r?\n/)) {
+      const section = /^\s*\[remote\s+"([^"]+)"\]\s*$/.exec(line)
+      if (section !== null) {
+        origin = section[1] === 'origin'
+        continue
+      }
+      if (!origin) continue
+      const url = /^\s*url\s*=\s*(.+?)\s*$/.exec(line)
+      if (url !== null) return url[1]!
+    }
+  } catch { /* unreadable git metadata carries no identity */ }
+  return null
+}
+
+function gitCheckout(start: string): { root: string; origin: string } | null {
+  let current = start
+  while (true) {
+    const marker = join(current, '.git')
+    if (existsSync(marker)) {
+      const config = gitConfigPath(marker, current)
+      const origin = config === null ? null : originFromConfig(config)
+      return origin === null ? null : { root: current, origin }
+    }
+    const parent = dirname(current)
+    if (parent === current) return null
+    current = parent
+  }
+}
+
+function checkoutSubpath(root: string, packageDir: string): string | null {
+  const value = relative(root, packageDir).replaceAll('\\', '/')
+  return value === '' || value === '.' || value.startsWith('../') ? null : value
+}
+
+/**
+ * Strong repository identities for a locally linked dependency (#141).
+ * Explicit github: specs already carry this evidence; only link:/file: need
+ * filesystem discovery. This compatibility wrapper returns only declared
+ * package.json identities; Git origins are exposed separately as hints.
+ */
+export function readInstalledRepoIdentities(
+  profile: string,
+  name: string,
+  spec: string,
+  explicitDir?: string,
+): string[] {
+  return readInstalledRepoEvidence(profile, name, spec, explicitDir).identities
+}
+
+export interface InstalledRepoEvidence {
+  identities: string[]
+  hints: string[]
+}
+
+/**
+ * Discover declared repository identities and weaker local-origin hints. A
+ * package.json repository declaration is authoritative; Git origin is only a
+ * disambiguation hint because a checkout may legitimately point at a fork.
+ */
+export function readInstalledRepoEvidence(
+  profile: string,
+  name: string,
+  spec: string,
+  explicitDir?: string,
+): InstalledRepoEvidence {
+  if (!PACKAGE_NAME_RE.test(name) || !/^(?:link|file):/i.test(spec)) return { identities: [], hints: [] }
+  const root = profileDir(profile, explicitDir)
+  const sourceDir = localSpecDirectory(root, spec)
+  const installedDir = installedPackageDirectory(root, name)
+  const manifestDir = installedDir ?? sourceDir
+  const manifest = manifestDir === null ? readInstalledManifest(profile, name, explicitDir) : manifestAt(manifestDir)
+  const repository = manifestRepository(
+    typeof manifest === 'object' && manifest !== null ? manifest as Record<string, unknown> : null,
+  )
+  const checkoutDir = sourceDir ?? (installedDir !== null && /^(?:link):/i.test(spec) ? installedDir : null)
+  const checkout = checkoutDir === null ? null : gitCheckout(checkoutDir)
+
+  if (repository !== null) {
+    const identities = githubRepoIdentities(repository.url, repository.directory)
+    if (identities.length > 0) return { identities, hints: [] }
+  }
+
+  if (checkout !== null) {
+    return { identities: [], hints: githubRemoteIdentities(checkout.origin, checkoutSubpath(checkout.root, checkoutDir!)) }
+  }
+
+  // node_modules is intentionally not searched upward for .git: a copied
+  // file: package may sit inside an unrelated profile checkout. Only the
+  // explicit local source directory is valid Git-origin evidence.
+  return { identities: [], hints: [] }
 }
 
 /** Pinned commit per `owner/repo` from the profile lockfile's codeload tarball URLs. */
@@ -292,6 +511,69 @@ export function readProfileBundles(profileDirectory: string): string[] {
 }
 
 /**
+ * Write the profile manifest atomically: a temp file in the same directory is
+ * written first, then renamed over package.json, so a crash mid-toggle never
+ * leaves a half-written manifest (the same guarantee order.ts's writer gives
+ * the reorder path). The trailing newline + 2-space indent match how every
+ * other writer in this repo serializes the manifest.
+ */
+function writeManifestAtomic(manifestPath: string, manifest: unknown): void {
+  const temp = `${manifestPath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  writeFileSync(temp, `${JSON.stringify(manifest, null, 2)}\n`)
+  renameSync(temp, manifestPath)
+}
+
+/**
+ * Drop one bundle from the profile manifest's `dsh.profile.bundles`, leaving
+ * the package installed as a dependency. This is the carrier-bundle half of a
+ * toggle-off (#224): a bundle whose patch reconfigures plugins it does NOT own
+ * (dsh-postgres-backends disables session-persistence-jsonl and reroutes
+ * storage-domain) keeps applying those side-effect rows on every boot while it
+ * stays in the stack, and the #147 ownership rule deliberately never writes
+ * them — so removing the bundle from the stack is the only thing that stops
+ * them all at once. The package itself stays installed; enabling re-adds it.
+ * @returns true when the bundle was present and removed.
+ */
+export function removeProfileBundle(profileDirectory: string, name: string): boolean {
+  const manifestPath = join(profileDirectory, 'package.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    dsh?: { profile?: { bundles?: unknown } }
+  }
+  const bundles = manifest.dsh?.profile?.bundles
+  if (!Array.isArray(bundles)) return false
+  const next = bundles.filter((entry): entry is string => typeof entry !== 'string' || entry !== name)
+  if (next.length === bundles.length) return false
+  manifest.dsh ??= {}
+  manifest.dsh.profile ??= {}
+  manifest.dsh.profile.bundles = next
+  writeManifestAtomic(manifestPath, manifest)
+  return true
+}
+
+/**
+ * Re-add a bundle to `dsh.profile.bundles` after a carrier toggle-off (#224).
+ * Idempotent: a bundle already present is left untouched. The name is appended
+ * (the install flow appends too); the loader re-validates ordering on the next
+ * composition, so a declared before/after rule surfaces there rather than here.
+ * @returns true when the bundle was added, false when it was already present.
+ */
+export function addProfileBundle(profileDirectory: string, name: string): boolean {
+  const manifestPath = join(profileDirectory, 'package.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+    dsh?: { profile?: { bundles?: unknown } }
+  }
+  manifest.dsh ??= {}
+  manifest.dsh.profile ??= {}
+  const existing = manifest.dsh.profile.bundles
+  const bundles = Array.isArray(existing) ? existing.filter((entry): entry is string => typeof entry === 'string') : []
+  if (bundles.includes(name)) return false
+  bundles.push(name)
+  manifest.dsh.profile.bundles = bundles
+  writeManifestAtomic(manifestPath, manifest)
+  return true
+}
+
+/**
  * Loader entry ids a newly added package would collide on with bundles the
  * profile ALREADY loads (#122).
  *
@@ -343,11 +625,20 @@ export function hasLoadableEntry(profileDirectory: string, name: string): boolea
   const dir = join(profileDirectory, 'node_modules', name)
   if (entryArtifactExists(dir)) return true
   // A carrier is only sound when something it mounts is itself loadable.
-  // Targets resolve hoisted (the dsh profile default) or nested under it.
+  // Targets resolve hoisted (the dsh profile default), nested under the
+  // carrier, or — #203 — one level up: pnpm hoists shared/in-box packages to
+  // `<profiles>/node_modules` when the profile is a workspace member, the
+  // same workspace-root fallback readProfileVisibleVersion (check.ts) already
+  // uses. A carrier naming an in-box package (@deepseek-ai/dsh-mcp-client and
+  // similar) resolves there and nowhere this function used to look, so pnpm
+  // exiting 0 was immediately followed by the market removing what it had
+  // just, correctly, installed.
+  const workspaceRoot = dirname(profileDirectory)
   return bundlePatchTargets(dir)
     .filter(target => target !== name)
     .some(target => entryArtifactExists(join(profileDirectory, 'node_modules', target))
-      || entryArtifactExists(join(dir, 'node_modules', target)))
+      || entryArtifactExists(join(dir, 'node_modules', target))
+      || entryArtifactExists(join(workspaceRoot, 'node_modules', target)))
 }
 
 /** Plugin subdirectories (depth 2) of a collection checkout, as relative paths. */
@@ -410,11 +701,21 @@ export function setAllowBuilds(profile: string, packages: string[], explicitDir?
   const file = join(profileDir(profile, explicitDir), 'pnpm-workspace.yaml')
   let yaml = ''
   try { yaml = readFileSync(file, 'utf8') } catch { /* created below */ }
-  const blockRe = /allowBuilds:\n((?:[ \t]+[^\n]*\n?)*)/
+  // `\r?\n`, not `\n`: a CRLF pnpm-workspace.yaml (every Windows editor, and
+  // git with core.autocrlf=true) put a `\r` between `allowBuilds:` and the
+  // newline, so the old pattern never matched an EXISTING block and appended
+  // a second one. Two top-level `allowBuilds:` keys is invalid YAML, and pnpm
+  // then refuses every install in that profile — not just the one that
+  // triggered it (#231 by @MichengAI).
+  const blockRe = /allowBuilds:[ \t]*\r?\n((?:[ \t]+[^\r\n]*\r?\n?)*)/g
   const map: Record<string, string> = {}
-  const blockMatch = blockRe.exec(yaml)
-  if (blockMatch !== null) {
-    for (const line of blockMatch[1].split(/\r?\n/)) {
+  // Every block, not just the first: a profile already broken by the bug
+  // above carries two, and merging them is what repairs it — dropping the
+  // extra silently would also drop whatever approvals it held.
+  const blockMatches = [...yaml.matchAll(blockRe)]
+  const blockMatch = blockMatches[0] ?? null
+  for (const match of blockMatches) {
+    for (const line of match[1].split(/\r?\n/)) {
       // The key itself may contain colons: git-hosted deps are only matched
       // by a `name@git+https://…` key (#68). The anchored boolean tail makes
       // the split land on the LAST colon, never inside a `://` — and doubles
@@ -438,11 +739,31 @@ export function setAllowBuilds(profile: string, packages: string[], explicitDir?
   // Bare package names, or the server-derived stable git form
   // `name@git+https://github.com/owner/repo.git` (#68) — nothing else.
   const GIT_KEY_RE = /^[A-Za-z0-9@/_.-]+@git\+https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\.git$/
+  // The commit-pinned form pnpm below 11.21 matches instead (#285). Held to
+  // the same shape as the one above rather than loosened into "anything with
+  // a URL in it": this list is what stops a caller writing arbitrary text
+  // into a file pnpm parses, and a wider pattern would spend that guarantee
+  // to save a line.
+  const CODELOAD_KEY_RE = /^[A-Za-z0-9@/_.-]+@https:\/\/codeload\.github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/tar\.gz\/[0-9a-f]{40}$/
   for (const pkg of packages) {
-    if (/^[A-Za-z0-9@/_.-]+$/.test(pkg) || GIT_KEY_RE.test(pkg)) map[pkg] = 'true'
+    if (/^[A-Za-z0-9@/_.-]+$/.test(pkg) || GIT_KEY_RE.test(pkg) || CODELOAD_KEY_RE.test(pkg)) map[pkg] = 'true'
   }
-  const block = Object.entries(map).map(([k, v]) => `  ${quoteYamlKey(k)}: ${v}`).join('\n')
-  const blockText = `allowBuilds:\n${block}\n`
-  writeFileSync(file, blockMatch !== null ? yaml.replace(blockRe, blockText) : `${yaml.replace(/\n?$/, '\n')}${blockText}`)
+  // Write back in the file's OWN line ending. Rewriting a CRLF workspace
+  // file with LF would leave it mixed, which is the same class of mess this
+  // fix exists to clean up.
+  const eol = /\r\n/.test(yaml) ? '\r\n' : '\n'
+  const block = Object.entries(map).map(([k, v]) => `  ${quoteYamlKey(k)}: ${v}`).join(eol)
+  const blockText = `allowBuilds:${eol}${block}${eol}`
+  let next: string
+  if (blockMatch === null) {
+    next = `${yaml.replace(/\r?\n?$/, eol)}${blockText}`
+  } else {
+    // The merged block replaces the first occurrence; any further ones are
+    // the duplicates this bug created and are dropped — their entries are
+    // already folded into `map` above, so nothing is lost.
+    let seen = 0
+    next = yaml.replace(blockRe, () => (seen++ === 0 ? blockText : ''))
+  }
+  writeFileSync(file, next)
   return Object.keys(map)
 }

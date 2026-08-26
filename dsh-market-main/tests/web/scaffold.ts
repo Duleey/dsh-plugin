@@ -12,6 +12,7 @@
 import { execSync, spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -80,6 +81,35 @@ function run(command: string, env: NodeJS.ProcessEnv, cwd: string = REPO_ROOT): 
 }
 
 /**
+ * Ask the OS for a port rather than guessing one.
+ *
+ * This used to be `3200 + random(500)`, i.e. somewhere in 3200-3699. On
+ * Windows that range is not ours to take: 3389 is RDP, and Hyper-V reserves
+ * further blocks around it (`netsh interface ipv4 show excludedportrange`).
+ * CI drew 3389 and died with `listen EACCES: permission denied`, which reads
+ * like a bug in this repo rather than a port we were never allowed to bind.
+ *
+ * Binding 0 makes the OS pick from what it will actually hand out, so the
+ * reserved ranges cannot come up at all. The gap between closing the probe
+ * and dsh binding is a race in principle; in practice the OS does not
+ * immediately reissue the port it just handed back.
+ */
+async function freePort(): Promise<number> {
+  return await new Promise<number>((resolve, reject) => {
+    const probe = createServer()
+    probe.on('error', reject)
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address()
+      const picked = typeof address === 'object' && address !== null ? address.port : 0
+      probe.close(() => {
+        if (picked === 0) reject(new Error('the OS returned no port'))
+        else resolve(picked)
+      })
+    })
+  })
+}
+
+/**
  * Pack the working tree and boot `dsh --profile web` on a free port inside
  * a temp DSH_HOME with the market installed from the tarball.
  */
@@ -112,12 +142,17 @@ export async function launchMarketScaffold(options: ScaffoldOptions = {}): Promi
     env = { ...env, DSHM_REGISTRY_URL: registry.catalogUrl, npm_config_registry: registry.npmUrl }
   }
 
-  const port = 3200 + Math.floor(Math.random() * 500)
+  const port = await freePort()
   const baseUrl = `http://127.0.0.1:${String(port)}`
 
-  /** Spawn dsh and wait until the market answers, or explain why it never did. */
+  /** Spawn dsh and wait until the market answers, or explain why it never did.
+   * `--no-open` (dsh >= 0.1.0-rc.8) is required here: without it, boot tries
+   * to launch a system browser, which on a headless CI runner (confirmed on
+   * Windows) left orphaned browser processes and the status endpoint never
+   * answering — surfacing as a "dsh boot timeout" with nothing actually
+   * wrong in this repo. */
   const boot = async (): Promise<ChildProcess> => {
-    const process_ = spawn(`${command} --profile web --port ${String(port)}`, {
+    const process_ = spawn(`${command} --profile web --port ${String(port)} --no-open`, {
       shell: true,
       cwd: DSH_CWD,
       env,

@@ -6,6 +6,32 @@ on:
   workflow_dispatch:
 
 jobs:
+  # `data/registry-snapshot.json` is a DOWNLOAD, not the catalog (see the
+  # `snapshot` script in package.json). A plugin entry hand-written into it
+  # survives exactly until the next refresh, so a contributor who adds one
+  # here has built something that cannot work — and it has now happened
+  # twice, despite the PR template saying so in words. Say it at the point
+  # the mistake is made instead, and say where the entry actually goes.
+  #
+  # Refreshing the snapshot for real is legitimate: label the PR
+  # `snapshot-refresh` and this step stands down.
+  wrong-repo-guard:
+    if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'snapshot-refresh')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Refuse a hand-edited catalog snapshot
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git diff --name-only "$BASE" "$HEAD" | grep -qx 'data/registry-snapshot.json'; then
+            echo "::error file=data/registry-snapshot.json::This file is a snapshot downloaded from awesome-dsh-plugin.com, not the plugin catalog. An entry added here is overwritten by the next refresh (Build site runs daily), so the plugin would never show up in the market. Add it to https://github.com/awesome-dsh-plugin/awesome-dsh-plugin instead — the snapshot then picks it up on its own. Genuinely refreshing the snapshot? Label the PR 'snapshot-refresh'."
+            exit 1
+          fi
+          echo "snapshot untouched"
+
   check:
     strategy:
       matrix:
@@ -60,7 +86,13 @@ jobs:
         with:
           version: 10
       - run: npm install
-      - run: npm install -g @deepseek-ai/dsh@0.1.0-rc.7
+      # rc.8+: earlier CLIs unconditionally launched a system browser on
+      # `dsh web` boot, which on the Windows runner left orphaned msedge
+      # processes and the status endpoint never answering — read as a
+      # flaky "dsh boot timeout" (and, on longer specs, an hours-long stuck
+      # job) with nothing wrong in this repo's own code. rc.8 added
+      # `--no-open`, which tests/web/scaffold.ts now passes.
+      - run: npm install -g @deepseek-ai/dsh@0.1.0-rc.8
       # --with-deps installs system libraries and is Linux-only.
       - run: npx playwright install --with-deps chromium
         if: runner.os == 'Linux'

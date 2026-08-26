@@ -14,7 +14,7 @@ vi.mock('node:dns/promises', () => ({ lookup: network.lookup }))
 vi.mock('node:https', () => ({ request: network.request }))
 
 import {
-  createProfileBackup, downloadWebdav, isPublicTarget, restoreProfileBackup, uploadWebdav,
+  createProfileBackup, downloadWebdav, isPublicTarget, restoreProfileBackup, unportableDeps, uploadWebdav,
 } from '../src/backup.ts'
 import { profileDir } from '../src/profile.ts'
 
@@ -88,6 +88,27 @@ describe('profile backup and restore', () => {
     expect(readFileSync(join(dir, 'package.json'), 'utf8')).toContain('plugin')
     expect(readFileSync(join(dir, 'plugin-config', 'settings.json'), 'utf8')).toBe('{"enabled":true}')
     expect(existsSync(join(dir, 'node_modules', 'plugin', 'large.bin'))).toBe(true)
+  })
+
+  it('excludes every .bak shape, not just the numeric suffix this repo writes (#205)', () => {
+    // A restore that carried these put the wreckage back: the reporter's
+    // profile came back with the very leftovers that made it need repairing.
+    // The shapes are real — recovery and the host's own repair paths write
+    // `.bak-asm` and `.rp-merged.bak`, neither of which the old
+    // `/\.bak-\d+$/` filter matched.
+    const dir = profileDir('web')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), '{"dependencies":{}}')
+    writeFileSync(join(dir, 'package.json.bak-1234'), '{"old":true}')
+    writeFileSync(join(dir, 'package.json.bak-asm'), '{"old":true}')
+    writeFileSync(join(dir, 'cordis.patch.yml.rp-merged.bak'), '- stale: true')
+    // ...while a file that merely CONTAINS "bak" is ordinary config and
+    // must survive: over-filtering silently drops a user's real settings.
+    writeFileSync(join(dir, 'bakery.yml'), 'keep: me')
+    writeFileSync(join(dir, 'my.backup.yml'), 'keep: me too')
+
+    const paths = createProfileBackup('web').files.map(file => file.path)
+    expect(paths).toEqual(['bakery.yml', 'my.backup.yml', 'package.json'])
   })
 
   it('rejects traversal paths without touching the profile', () => {
@@ -246,5 +267,42 @@ describe('private-network guard boundaries', () => {
 
   it('still allows the addresses immediately outside those ranges', () => {
     for (const [ip, why] of allowed) expect(isPublicTarget(ip), `${ip} (${why})`).toBe(true)
+  })
+})
+
+describe('unportableDeps (#205)', () => {
+  it('names link:/file: specs pointing outside this machine\'s profile', () => {
+    expect(unportableDeps({
+      'dev-plugin': 'link:/Users/rudy/dev/dev-plugin',
+      'tarball-plugin': 'file:/home/rudy/pkgs/x.tgz',
+      'win-plugin': 'link:C:\\dev\\win-plugin',
+      'unc-plugin': 'file:\\\\\\\\server\\\\share\\\\p',
+    }).map(dep => dep.name).sort()).toEqual(['dev-plugin', 'tarball-plugin', 'unc-plugin', 'win-plugin'])
+  })
+
+  it('leaves portable specs alone, including RELATIVE local paths', () => {
+    // A relative file:/link: resolves against the profile directory, which
+    // the restore recreates — those travel fine and flagging them would be
+    // a false alarm on a working setup.
+    expect(unportableDeps({
+      'ranged': '^1.2.3',
+      'exact': '1.2.3',
+      'from-git': 'github:owner/repo',
+      'relative-link': 'link:./vendor/plugin',
+      'relative-file': 'file:../sibling',
+      'tagged': 'latest',
+    })).toEqual([])
+  })
+
+  it('is defensive about shapes a hand-edited manifest can produce', () => {
+    expect(unportableDeps(undefined)).toEqual([])
+    expect(unportableDeps(null)).toEqual([])
+    expect(unportableDeps([])).toEqual([])
+    expect(unportableDeps({ weird: 42 })).toEqual([])
+  })
+
+  it('carries the offending spec, so the message can name what to repoint', () => {
+    expect(unportableDeps({ 'dev-plugin': 'link:/Users/rudy/dev/dev-plugin' }))
+      .toEqual([{ name: 'dev-plugin', spec: 'link:/Users/rudy/dev/dev-plugin' }])
   })
 })

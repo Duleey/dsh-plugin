@@ -29,7 +29,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { logEvent } from './log.ts'
-import { parsePatchFile } from './check.ts'
+import { parsePatchFile, parsePatchText } from './check.ts'
 import { bundlePatchInsertedIds, parsePatchRows } from './profile.ts'
 
 /** The slice of the loader tree this module needs. */
@@ -174,6 +174,76 @@ export function readUserPatchState(patchPath: string): PatchState {
   return { disables, forced, inserts }
 }
 
+/**
+ * User-authored insert rows that still load `packageName` (or one of its
+ * exported subpaths). This evidence deliberately stays separate from the
+ * package's own bundle declaration: uninstall may clean market-owned rows,
+ * but it must never rewrite an insert the user owns.
+ *
+ * A missing patch is the ordinary empty-profile shape. `null` means the
+ * existing file could not be read as DSH's patch dialect; callers must treat
+ * that as indeterminate and refuse the destructive step.
+ */
+export function userPatchPackageReferences(patchPath: string, packageName: string): string[] | null {
+  let source: string
+  try {
+    source = readFileSync(patchPath, 'utf8')
+  } catch (error) {
+    const code = error !== null && typeof error === 'object' && 'code' in error
+      ? (error as { code?: unknown }).code
+      : undefined
+    if (code === 'ENOENT') return []
+    return null
+  }
+
+  // Use the same schema as profile composition, including !!js scalars. A
+  // line scanner cannot distinguish flow-style entries or nested loader
+  // groups from arbitrary config keys in a hand-written user patch.
+  const rows = parsePatchText(source)
+  if (rows === null) return null
+  const insertedNames = new Set<string>()
+  const visiting = new Set<unknown[]>()
+  const visited = new Set<unknown[]>()
+  const collect = (entries: unknown[]): boolean => {
+    if (visited.has(entries)) return true
+    if (visiting.has(entries)) return false
+    visiting.add(entries)
+    for (const entry of entries) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        visiting.delete(entries)
+        return false
+      }
+      const row = entry as Record<string, unknown>
+      if ('name' in row && typeof row.name !== 'string') {
+        visiting.delete(entries)
+        return false
+      }
+      if (typeof row.name === 'string') insertedNames.add(row.name)
+      // Only group rows treat an array-valued config as child loader rows.
+      // Other plugins may use arrays of `{ name: ... }` as ordinary options,
+      // and those must not become false package references.
+      if (row.group === true && Array.isArray(row.config)) {
+        if (!collect(row.config)) {
+          visiting.delete(entries)
+          return false
+        }
+      }
+    }
+    visiting.delete(entries)
+    visited.add(entries)
+    return true
+  }
+  for (const patch of rows) {
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) return null
+    const patchRow = patch as Record<string, unknown>
+    if (!('insert' in patchRow)) continue
+    if (!Array.isArray(patchRow.insert) || !collect(patchRow.insert)) return null
+  }
+  return [...insertedNames].filter(
+    reference => reference === packageName || reference.startsWith(`${packageName}/`),
+  )
+}
+
 /** The include entry's id prefix (loader entry ids look like `include:X`). */
 function includePrefix(host: PatchHost): string {
   for (const entry of host.loader.entries()) {
@@ -224,6 +294,60 @@ export function rowIdsForPackage(host: PatchHost, profileDirectory: string, pack
     ids.add(id)
   }
   return [...ids]
+}
+
+/**
+ * Top-level patch rows that DISABLE another plugin: a row carrying both an
+ * `id` and `disabled: true`. Rows nested under an `insert:` block are separate
+ * array elements shaped `{ insert: [...] }`, so anything here is by definition
+ * a sibling row targeting a plugin this package does not own.
+ */
+function foreignDisableIds(rows: unknown[]): string[] {
+  const ids: string[] = []
+  for (const row of rows) {
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) continue
+    const record = row as Record<string, unknown>
+    const id = record.id
+    if (typeof id === 'string' && record.disabled === true && !ids.includes(id)) ids.push(id)
+  }
+  return ids
+}
+
+/**
+ * The ids of OTHER plugins a package's bundle patch DISABLES — top-level
+ * `- id: X` + `disabled: true` rows targeting plugins it does not own. This is
+ * the precise marker of a bundle whose toggle-off can brick the boot (#224):
+ * dsh-postgres-backends disables session-persistence-jsonl, so once the market
+ * also disables the postgres backends nothing provides sessionPersistence.
+ *
+ * A bundle that merely RECONFIGURES a neighbour is deliberately NOT counted:
+ * the e2e fixture-cross tweaks dshm-fixture-b's config, and #147 requires
+ * disabling it to leave that neighbour live — dropping such a bundle from the
+ * stack broke its re-enable. Config-only side effects stay on the normal #147
+ * path; only a foreign `disabled: true` triggers the bundle removal. Removing
+ * the bundle still neutralizes any config side effects it carries, since its
+ * whole patch stops applying.
+ *
+ * Reads both patch sources like rowIdsForPackage — the declared dsh.bundle.patch
+ * and the conventional root cordis.patch.yml — so either form is detected.
+ */
+export function carrierDisableIds(profileDirectory: string, packageName: string): string[] {
+  const packageDir = join(profileDirectory, 'node_modules', packageName)
+  const disabled = new Set<string>()
+  const collectFromFile = (patchPath: string): void => {
+    const rows = parsePatchFile(patchPath)
+    if (rows === null) return
+    for (const id of foreignDisableIds(rows)) disabled.add(id)
+  }
+  try {
+    const manifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')) as {
+      dsh?: { bundle?: { patch?: unknown } }
+    }
+    const declared = manifest.dsh?.bundle?.patch
+    if (typeof declared === 'string' && declared !== '') collectFromFile(join(packageDir, declared))
+  } catch { /* package not installed — nothing to attribute */ }
+  collectFromFile(join(packageDir, 'cordis.patch.yml'))
+  return [...disabled]
 }
 
 /**
