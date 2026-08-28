@@ -29,12 +29,14 @@ dsh plugin --profile web add dshmarket
 
 ## 你会得到
 
-- **逛与搜**——完整社区目录（1550+ 插件，每天在涨），分类筛选、star 数、最热/最新排序，中英描述跟随界面语言
+- **逛与搜**——完整社区目录（2300+ 插件，每天在涨），分类筛选、star 数、最热/最新排序，中英描述跟随界面语言
 - **截图展示**——App Store 式截图，多图自动轮播，点开还能看大图；作者在 registry 里策展的截图列表卡片就直接显示（零额外请求），没有策展的插件则在打开安装弹窗时自动从 README 抽取；图片仅从 GitHub 图床加载
+- **评论**——每张卡片都能就地打开该插件的讨论。它和插件在 [dshmarket.com](https://dshmarket.com) 与[目录站](https://awesome-dsh-plugin.com)上的页面共用同一条讨论，一个插件只有一处对话，而不是三处。底层是 GitHub Discussions（经由 giscus）：打开即加载，只有发表评论才需要 GitHub 账号；说明里也直说打开会连接 giscus.app 与 GitHub
 - **主题**——独立主题页：装完立即生效，点一下切换（主题互斥、选择跨重启保留），卸载即恢复
 - **一键安装**——确认来源，实时进度；多数插件刷新页面即可用，无需重启
 - **备份与恢复**——把 profile 的插件清单与配置导出为可读 JSON，换机导入，存到 WebDAV 并每日自动备份，或通过私有 GitHub Gist 跨机器同步；恢复采用**合并**方式（备份之后新装的插件会保留），写入前校验、失败自动回滚
 - **更新**——逐插件检测（npm 版本或锁定 commit 对比 HEAD），一键更新或全部更新；市场自己也走同一通道升级
+- **公共更新接口**——插件自己的设置页可调用带版本号、能力探测和回滚状态的[更新 API v1](UPDATE-API-V1.md)（beta），无需复制包管理逻辑，也不依赖市场 UI 的私有响应字段
 - **卸载**——两步确认防误触；本次会话装的插件即点即卸
 - **热禁用 / 启用**——开关会往 profile 的 `cordis.patch.yml`（官方补丁层，机制移植自 [dsh-plugin-hub](https://github.com/Noob-stupid/dsh-plugin-hub)）写入 `- id: …` + `disabled: true|false`：DSH 的 HMR 约 1 秒内重新组合，无需重启，loader 每次启动都会重新应用这个选择；手工改过的补丁行会显示成徽标，宿主基础设施插件禁止开关，补丁文件格式不对时绝不会被写得更糟
 - **按需重启**——无法热加载的变更会在待重启提示旁显示一键重启；操作仅接受本机同源请求
@@ -105,6 +107,10 @@ DSHM_REGISTRY_URL=https://your-mirror.example/plugins.json dsh web
 ### DeepSeek Harness Desktop（anywhere-labs）
 
 [deepseek-harness-desktop](https://github.com/anywhere-labs/deepseek-harness-desktop)——基于 Electron 的 DeepSeek Harness 桌面客户端，理念是「万物皆插件，桌面本身也是插件」：支持 profile 切换、内置 Node 与 pnpm，安装前会先给 profile 拍快照以便回滚。[dshdesktop.cn](https://dshdesktop.cn)
+
+### DSH App
+
+[dsh-app](https://github.com/RyensX/dsh-app)——基于 Tauri 2（而非 Electron）的 DeepSeek Harness 桌面客户端，因此安装包小得多，界面走系统 webview。AGPL-3.0。
 
 ### DSH Get
 

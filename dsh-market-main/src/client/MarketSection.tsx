@@ -35,12 +35,13 @@ import {
   type MenuEntry,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import css from './Market.module.css'
+import { CommentsModal } from './CommentsModal.tsx'
 import { OperationsPanel } from './OperationsPanel.tsx'
 import { clearSettled, drop, enqueue, patch as patchRecord, recordForUrl } from './operations.ts'
 import type { OperationRecord } from './operations.ts'
 import { Diagnostics } from './Diagnostics.tsx'
 import {
-  avatarColor, entryForDep, githubProxyInUse, githubUrl, groupSwitchState, humanOutput, installedForCatalog, isInstalled, looksTerminal, matchInstalledName, orderedCategories, pluginCategories,
+  api, avatarColor, entryForDep, githubProxyInUse, githubUrl, groupSwitchState, humanOutput, installedForCatalog, isInstalled, looksTerminal, matchInstalledName, orderedCategories, pluginCategories,
   formatCount, pageItems, pluginName, pluginScreenshotCandidates, pluginScreenshots, rankThemeScreenshots, readSession, safeScreenshots, setGithubProxy, themePlugins as themePluginsOf, themeSwatch, TIME_RANGE_DAYS, visiblePlugins,
 } from './market-data.ts'
 import type {
@@ -281,6 +282,55 @@ function Pager({ currentPage, totalPages, pageSize, onGoToPage, onChangePageSize
  * Card avatar: the plugin owner's GitHub avatar (no API, browser-cached),
  * falling back to the initial-letter tile when it can't load.
  */
+/** Inline pass: `code` spans and **bold**, everything else plain text. */
+function mdInline(text: string): Array<string | JSX.Element> {
+  return text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return <strong key={i}>{part.slice(2, -2)}</strong>
+    }
+    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
+      return <code key={i} className={css.notesCode}>{part.slice(1, -1)}</code>
+    }
+    return part
+  })
+}
+
+/**
+ * Release-body markdown, reduced to what a reading dialog needs: headings,
+ * bullets, paragraphs, bold, inline code. Every character arrives as a React
+ * text child (auto-escaped) — nothing from the repo is ever interpreted as
+ * markup, so this stays free of the HTML surface real markdown parsers open.
+ */
+function renderMarkdown(md: string): Array<JSX.Element | string> {
+  const out: Array<JSX.Element | string> = []
+  let bullets: string[] | null = null
+  const flushList = (): void => {
+    if (bullets === null) return
+    const items = bullets
+    out.push(<ul key={`l${out.length}`} className={css.notesList}>{items.map((item, i) => <li key={i}>{mdInline(item)}</li>)}</ul>)
+    bullets = null
+  }
+  for (const line of md.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed === '') { flushList(); continue }
+    const heading = /^#{1,6}\s+(.*)$/.exec(trimmed)
+    if (heading !== null) {
+      flushList()
+      out.push(<div key={`h${out.length}`} className={css.notesH}>{mdInline(heading[1])}</div>)
+      continue
+    }
+    const bullet = /^[-*]\s+(.*)$/.exec(trimmed)
+    if (bullet !== null) {
+      ;(bullets ??= []).push(bullet[1])
+      continue
+    }
+    flushList()
+    out.push(<div key={`p${out.length}`} className={css.notesP}>{mdInline(line)}</div>)
+  }
+  flushList()
+  return out
+}
+
 function OwnerAvatar({ name, owner }: { name: string; owner: string }) {
   const [failed, setFailed] = useState(false)
   if (failed || owner === '') {
@@ -345,12 +395,16 @@ function ScreenshotStrip({ plugin, onOpen }: { plugin: RegistryPlugin; onOpen: (
  * clock instead of letting it fire again moments later: without that, a
  * deliberate "go back one" reads as broken when it auto-advances right past
  * where the user just navigated to.
+ *
+ * `intervalMs <= 0` disables the timer entirely (no auto-advance at all);
+ * manual jumps still work. The lightbox uses this: a full-bleed image needs
+ * to stay put until the viewer moves on, so it must never page itself.
  */
 function useAutoCarousel(count: number, initial: number, intervalMs = 3500): [number, (i: number) => void] {
   const [index, setIndexState] = useState(initial)
   const [resetTick, setResetTick] = useState(0)
   useEffect(() => {
-    if (count <= 1) return
+    if (count <= 1 || intervalMs <= 0) return
     const timer = setInterval(() => { setIndexState(i => (i + 1) % count) }, intervalMs)
     return () => clearInterval(timer)
   }, [count, intervalMs, resetTick])
@@ -718,7 +772,12 @@ function CardDesc({ text, t }: { text: string; t: Translate }) {
  * vs "full size" asset to fetch.
  */
 function ScreenshotLightbox({ shots, startIndex, onClose, t }: { shots: string[]; startIndex: number; onClose: () => void; t: Translate }) {
-  const [index, setIndex] = useAutoCarousel(shots.length, startIndex, 4000)
+  // Full-bleed previews must not auto-advance: a chart or a screenshot needs
+  // to stay readable until the viewer moves on, so the carousel timer is
+  // disabled with intervalMs = 0. Arrows, dots, and the keyboard still
+  // navigate manually.
+  const [index, setIndex] = useAutoCarousel(shots.length, startIndex, 0)
+  const host = useMarketPortalHost()
   useEffect(() => {
     // Capture phase + stopPropagation: the Settings dialog underneath is a
     // Modal with its own Escape-to-close handling, also on window/document.
@@ -789,7 +848,7 @@ function ScreenshotLightbox({ shots, startIndex, onClose, t }: { shots: string[]
         </>
       )}
     </div>,
-    marketPortalHost(),
+    host,
   )
 }
 
@@ -817,10 +876,30 @@ function marketPortalHost(): HTMLElement {
     // plugins a real portal slot, can see who owns it.
     portalHost.setAttribute('data-dsh-market-portal', '')
   }
-  // appendChild on an existing child MOVES it to the end — the stacking
-  // guarantee, refreshed each time without ever creating a second container.
-  document.body.appendChild(portalHost)
   return portalHost
+}
+
+/**
+ * Move the container to the end of `document.body`, which is what keeps this
+ * package's layers above the host's own portalled dialog.
+ *
+ * In a layout effect, NOT during render. `createPortal` needs the element
+ * while rendering, but appending it does not belong there: React may start a
+ * render, abandon it and start again, so a mutation in the render body runs
+ * for passes that never commit — and this particular mutation reorders
+ * `document.body`, the one container this package shares with the host's
+ * separate React root. That is the same shared-child-list hazard #293 was
+ * about, just arrived at from the other side. Committing it in an effect
+ * means it happens once, after React is done, in the order React expects.
+ */
+function useMarketPortalHost(): HTMLElement {
+  const host = marketPortalHost()
+  useLayoutEffect(() => {
+    // appendChild on an existing child MOVES it to the end — the stacking
+    // guarantee, refreshed on open without ever creating a second container.
+    document.body.appendChild(host)
+  }, [host])
+  return host
 }
 
 /** Test hook: the container is module state and outlives a component unmount. */
@@ -1012,6 +1091,8 @@ export function MarketSection(props: MarketSectionProps) {
   const [qInstalled, setQInstalled] = useState('')
   const [cat, setCat] = useState('all')
   const [confirming, setConfirming] = useState<RegistryPlugin | null>(null)
+  /** The plugin whose comment thread is open, or null. */
+  const [commentsFor, setCommentsFor] = useState<RegistryPlugin | null>(null)
   /** A rejected install and the installed plugins it clashed with, one entry
    * per owner as grouped by the host. */
   interface ConflictNotice {
@@ -1025,6 +1106,10 @@ export function MarketSection(props: MarketSectionProps) {
    */
   const [records, setRecords] = useState<OperationRecord[]>([])
   const recordSeq = useRef(0)
+  /** The synthetic install task rebuilt from dshm-pending after a remount. */
+  const recoveredInstall = useRef<{ id: string; url: string; name?: string } | null>(null)
+  /** The synthetic task rebuilt from dshm-updating after this section remounts. */
+  const recoveredUpdateRecordId = useRef<string | null>(null)
   /** Raised by the card marker, so "查看详情" lands on the record itself. */
   const [operationsOpen, setOperationsOpen] = useState(false)
   const openOperations = useCallback(() => setOperationsOpen(true), [])
@@ -1061,6 +1146,20 @@ export function MarketSection(props: MarketSectionProps) {
   const updateIdleStrikes = useRef(0)
   const [doneUrls, setDoneUrls] = useState<string[]>([])
   const [installError, setInstallError] = useState<string | null>(null)
+  /** The notes payload the server answers with, verbatim (see /changelog). */
+  type NoteRelease = { tag: string | null; name: string | null; publishedAt: string | null; url: string | null; body: string }
+  type NoteCommit = { sha: string; message: string; date: string | null }
+  interface UpdateNotes {
+    kind: 'release' | 'commits' | 'npm' | 'none'
+    release?: NoteRelease
+    commits?: { items: NoteCommit[]; found: boolean }
+    npmTimes?: Array<{ version: string; date: string }>
+  }
+  type ResolvedNotes =
+    | { kind: 'release'; release: NoteRelease }
+    | { kind: 'commits'; commits: { items: NoteCommit[]; found: boolean } }
+    | { kind: 'npm'; npmTimes: Array<{ version: string; date: string }> }
+    | { kind: 'none' }
   interface CompatibilityNotice {
     code: 'soft-incompatible'
     risks: Array<{ plugin: string; peer: string; range: string; resolved: string; direction: string }>
@@ -1084,7 +1183,7 @@ export function MarketSection(props: MarketSectionProps) {
    */
   const doExportLog = useCallback(() => {
     setExportState('busy')
-    fetch('/dsh-market/logs')
+    fetch(api('/dsh-market/logs'))
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${String(res.status)}`)
         const blob = await res.blob()
@@ -1105,6 +1204,10 @@ export function MarketSection(props: MarketSectionProps) {
   const exportToastDone = useCallback(() => setExportState('idle'), [])
   const [updates, setUpdates] = useState<Record<string, UpdateStatus>>({})
   const [updatingName, setUpdatingName] = useState<string | null>(null)
+  /** Update-notes dialog (#294): which row opened it, and what it resolved to. */
+  const [notesFor, setNotesFor] = useState<{ name: string; current: string | null; latest: string | null; repoUrl: string | null } | null>(null)
+  const [updateNotes, setUpdateNotes] = useState<ResolvedNotes | null>(null)
+  const [notesState, setNotesState] = useState<'loading' | 'ready' | 'fail'>('loading')
   // Plugin blocked by pnpm's fresh-release safety wait; arms the update-now button.
   const [staleName, setStaleName] = useState<string | null>(null)
   // Local link:/file: restore: the red banner asks before swapping to the catalog.
@@ -1127,6 +1230,15 @@ export function MarketSection(props: MarketSectionProps) {
   const [activations, setActivations] = useState<Record<string, ActivationInfo>>({})
   /** #60: persisted disable list + custom groups, straight from /installed. */
   const [disabledNames, setDisabledNames] = useState<string[]>([])
+  /** The user's own note per plugin (#347): package name → text. */
+  const [notes, setNotes] = useState<Record<string, string>>({})
+  /** Rows the user asked to show the AUTHOR's description on, despite a note. */
+  const [showTheirs, setShowTheirs] = useState<string[]>([])
+  /** The row whose note is being edited, and the text in the box. */
+  const [notingName, setNotingName] = useState<string | null>(null)
+  const [noteDraft, setNoteDraft] = useState('')
+  /** The disable set as of the first load; null until it arrives. */
+  const loadedDisabled = useRef<Set<string> | null>(null)
   /**
    * Patch-layer flags (port of dsh-plugin-hub): packages whose bundle rows
    * the user patch layer disables / force-enables. The UI treats them as the
@@ -1266,7 +1378,7 @@ export function MarketSection(props: MarketSectionProps) {
   const [catsSentinel, setCatsSentinel] = useState<HTMLDivElement | null>(null)
 
   const refreshInstalled = useCallback((force?: boolean) => {
-    fetch('/dsh-market/installed', { cache: 'no-store' })
+    fetch(api('/dsh-market/installed'), { cache: 'no-store' })
       .then(res => res.json())
       .then(body => {
         setInstalled(body.installed || {})
@@ -1274,7 +1386,16 @@ export function MarketSection(props: MarketSectionProps) {
         setRepoHints(installedRepoHints(body.repoHints))
         setInstalledFiles(Array.isArray(body.present) ? body.present : Object.keys(body.installed || {}))
         setSkins(body.live || [])
-        if (Array.isArray(body.disabled)) setDisabledNames(body.disabled)
+        if (Array.isArray(body.disabled)) {
+          setDisabledNames(body.disabled)
+          // The switch positions this page was BUILT with. A toggle away from
+          // them needs a refresh; a toggle back to them does not, and the
+          // banner has to be able to say so (#340).
+          if (loadedDisabled.current === null) loadedDisabled.current = new Set(body.disabled as string[])
+        }
+        if (body.notes !== null && typeof body.notes === 'object' && !Array.isArray(body.notes)) {
+          setNotes(body.notes as Record<string, string>)
+        }
         if (Array.isArray(body.patchDisabled)) setPatchDisabledNames(body.patchDisabled)
         if (body.groups && typeof body.groups === 'object') setGroups(body.groups)
         if (Array.isArray(body.groupOrder)) setGroupOrder(body.groupOrder)
@@ -1287,7 +1408,7 @@ export function MarketSection(props: MarketSectionProps) {
         setHostDependencyFindings(findings)
       })
       .catch(() => {})
-    fetch('/dsh-market/updates' + (force === true ? '?force=1' : ''), { cache: 'no-store' })
+    fetch(api('/dsh-market/updates') + (force === true ? '?force=1' : ''), { cache: 'no-store' })
       .then(res => res.json())
       .then(body => setUpdates(body.updates || {}))
       .catch(() => {})
@@ -1323,7 +1444,7 @@ export function MarketSection(props: MarketSectionProps) {
 
   const loadCatalog = useCallback(() => {
     setLoadError(null)
-    return fetch('/dsh-market/registry', { cache: 'no-store' })
+    return fetch(api('/dsh-market/registry'), { cache: 'no-store' })
       .then(async (res) => {
         const body = (await res.json().catch(() => ({}))) as { registry?: Registry; error?: string }
         if (!res.ok) throw new Error(typeof body.error === 'string' ? body.error : `HTTP ${String(res.status)}`)
@@ -1344,7 +1465,7 @@ export function MarketSection(props: MarketSectionProps) {
 
   useEffect(() => {
     void loadCatalog()
-    fetch('/dsh-market/status', { cache: 'no-store' })
+    fetch(api('/dsh-market/status'), { cache: 'no-store' })
       .then(res => res.json())
       .then(status => {
         setEnvReady(status.pnpm !== false)
@@ -1407,7 +1528,7 @@ export function MarketSection(props: MarketSectionProps) {
   const fixEnv = useCallback(() => {
     setEnvFixing(true)
     setEnvFailed(false)
-    fetch('/dsh-market/setup-pnpm', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+    fetch(api('/dsh-market/setup-pnpm'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
       .then(res => res.json())
       .then(body => {
         if (body.ok) {
@@ -1426,14 +1547,44 @@ export function MarketSection(props: MarketSectionProps) {
   // the poll below converges the button state from the host's ground truth.
   useEffect(() => {
     const pending = readSession('dshm-pending')
-    if (pending !== null && typeof pending.url === 'string') setBusyUrl(pending.url)
+    if (pending !== null && typeof pending.url === 'string') {
+      setBusyUrl(pending.url)
+      recoveredInstall.current = {
+        id: `recovered-install:${pending.url}`,
+        url: pending.url,
+        ...(typeof pending.name === 'string' && pending.name !== '' ? { name: pending.name } : {}),
+      }
+    }
     // Same recovery for an update in flight: closing the config page unmounts
     // this section and drops `updatingName` with it, so the running row's
     // progress vanished on reopen. The marker restores the row and the poll
     // below converges it from the host's ground truth.
     const updating = readSession('dshm-updating')
-    if (updating !== null && typeof updating.name === 'string' && updating.name !== '') setUpdatingName(updating.name)
+    if (updating !== null && typeof updating.name === 'string' && updating.name !== '') {
+      setUpdatingName(updating.name)
+      const id = `recovered-update:${updating.name}`
+      recoveredUpdateRecordId.current = id
+      setRecords(list => list.some(record =>
+        record.kind === 'update' && record.name === updating.name && record.state === 'running')
+        ? list
+        : enqueue(list, { id, kind: 'update', name: updating.name, state: 'running' }))
+    }
   }, [])
+
+  // New markers carry the name and recover immediately. Older markers only
+  // carried the URL, so wait for the catalog and resolve the same task from it.
+  useEffect(() => {
+    const recovered = recoveredInstall.current
+    if (recovered === null) return
+    const name = recovered.name ?? data?.plugins.find(plugin => plugin.url === recovered.url)?.name
+    if (name === undefined) return
+    recovered.name = name
+    setRecords(list => list.some(record => record.id === recovered.id)
+      ? list
+      : enqueue(list, {
+          id: recovered.id, kind: 'install', name, url: recovered.url, state: 'running',
+        }))
+  }, [data])
 
   useEffect(() => {
     if (busyUrl === null && updatingName === null) {
@@ -1445,7 +1596,7 @@ export function MarketSection(props: MarketSectionProps) {
       return
     }
     const timer = setInterval(() => {
-      fetch('/dsh-market/status', { cache: 'no-store' })
+      fetch(api('/dsh-market/status'), { cache: 'no-store' })
         .then(res => res.json())
         .then(status => {
           setHostBusy(status.busy === true)
@@ -1491,6 +1642,11 @@ export function MarketSection(props: MarketSectionProps) {
               if (nowInstalled) {
                 idleStrikes.current = 0
                 sessionStorage.removeItem('dshm-pending')
+                const recovered = recoveredInstall.current
+                if (recovered !== null) {
+                  setRecords(list => drop(list, recovered.id))
+                  recoveredInstall.current = null
+                }
                 setDoneUrls(urls => urls.includes(busyUrl) ? urls : urls.concat(busyUrl))
                 setBusyUrl(null)
               } else if (++idleStrikes.current >= 2) {
@@ -1499,6 +1655,11 @@ export function MarketSection(props: MarketSectionProps) {
                 // button says "installing" forever — across reloads (#32).
                 idleStrikes.current = 0
                 sessionStorage.removeItem('dshm-pending')
+                const recovered = recoveredInstall.current
+                if (recovered !== null) {
+                  setRecords(list => drop(list, recovered.id))
+                  recoveredInstall.current = null
+                }
                 setBusyUrl(null)
                 setInstallError(t('installFail') + ' — ' + t('exportLog'))
               }
@@ -1514,6 +1675,11 @@ export function MarketSection(props: MarketSectionProps) {
               if (++updateIdleStrikes.current >= 2) {
                 updateIdleStrikes.current = 0
                 sessionStorage.removeItem('dshm-updating')
+                const recoveredId = recoveredUpdateRecordId.current
+                if (recoveredId !== null) {
+                  setRecords(list => drop(list, recoveredId))
+                  recoveredUpdateRecordId.current = null
+                }
                 setUpdatingName(null)
                 refreshInstalled()
               }
@@ -1535,6 +1701,17 @@ export function MarketSection(props: MarketSectionProps) {
       else el.scrollTop = 0
     }
   }
+
+  // The .body scroller is shared across top tabs AND in-tab list replacements
+  // (Discover/Themes category, search, sort; Installed search and list/groups).
+  // Leaving scrollTop in place opens the next list mid-page — or, when it is
+  // shorter, at its clamped bottom. Instant (not the smooth scrollToTop used
+  // for pagination) so the jump happens before paint.
+  useLayoutEffect(() => {
+    const el = bodyRef.current
+    if (el !== null) el.scrollTop = 0
+    setShowTop(false)
+  }, [tab, q, cat, sortField, sortDir, timeRange, qThemes, themeSortField, themeSortDir, themeTimeRange, qInstalled, installedView])
 
   const plugins = useMemo(
     () => (data === null ? [] : visiblePlugins(data.plugins, {
@@ -1586,7 +1763,7 @@ export function MarketSection(props: MarketSectionProps) {
   const doRollback = useCallback((rollbackId: string) => {
     setRollingBack(true)
     setInstallError(null)
-    fetch('/dsh-market/rollback', {
+    fetch(api('/dsh-market/rollback'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ rollbackId }),
@@ -1630,8 +1807,8 @@ export function MarketSection(props: MarketSectionProps) {
     setRecords(list => enqueue(list, {
       id: recordId, kind: 'install', name: plugin.name, url: plugin.url, state: 'running',
     }))
-    sessionStorage.setItem('dshm-pending', JSON.stringify({ url: plugin.url }))
-    fetch('/dsh-market/install', {
+    sessionStorage.setItem('dshm-pending', JSON.stringify({ url: plugin.url, name: plugin.name }))
+    fetch(api('/dsh-market/install'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ url: plugin.url }),
@@ -1707,7 +1884,21 @@ export function MarketSection(props: MarketSectionProps) {
           const blocked = Array.isArray(body.ignoredBuilds) ? body.ignoredBuilds.map(String) : []
           if (blocked.length > 0) setBuildsSkipped({ plugin, names: blocked })
           const text = (v: unknown) => typeof v === 'string' ? v : (v && typeof (v as any).text === 'string') ? (v as any).text : v == null ? '' : JSON.stringify(v)
-          const detail = text(body.error) || humanOutput([text(body.stderr), text(body.stdout)].filter(Boolean).join('\n')) || ('exit ' + body.exitCode)
+          const orphans = Array.isArray(body.orphanBundles) ? body.orphanBundles.map(String) : []
+          const failure = text(body.error) || humanOutput([text(body.stderr), text(body.stdout)].filter(Boolean).join('\n')) || ('exit ' + body.exitCode)
+          // The profile will not boot as it stands (#339). Said FIRST, because
+          // it outranks whatever else went wrong: a plugin that failed to
+          // install is recoverable, a profile that cannot start is not — and
+          // the user would otherwise meet it as a Node stack trace after the
+          // next restart, with nothing linking it to this operation.
+          // A stale catalog entry (#346) is said before pnpm's own wording,
+          // which for that failure reads like the user broke something.
+          const staleEntry = typeof body.staleEntry === 'string' ? body.staleEntry : null
+          const detail = [
+            orphans.length > 0 ? `${t('orphanBundle')} ${orphans.join(', ')}` : null,
+            staleEntry,
+            failure,
+          ].filter(Boolean).join('\n')
           // Carry the blocked names onto the record too: the panel is where
           // this failure is read, so it is where the one-click way out has to
           // be (#314).
@@ -1747,7 +1938,7 @@ export function MarketSection(props: MarketSectionProps) {
     const removed: string[] = []
     try {
       for (const group of record.conflicts ?? []) {
-        const response = await fetch('/dsh-market/uninstall', {
+        const response = await fetch(api('/dsh-market/uninstall'), {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ name: group.owner }),
@@ -1805,7 +1996,7 @@ export function MarketSection(props: MarketSectionProps) {
     const awaitNewBoot = () => {
       const deadline = Date.now() + 60000
       const poll = () => {
-        fetch('/dsh-market/status', { cache: 'no-store' })
+        fetch(api('/dsh-market/status'), { cache: 'no-store' })
           .then(res => res.json())
           .then((next) => {
             if (typeof next.boot === 'string' && next.boot !== previousBoot) {
@@ -1827,7 +2018,7 @@ export function MarketSection(props: MarketSectionProps) {
       poll()
     }
     const requestRestart = (attemptsLeft: number) => {
-      fetch('/dsh-market/restart', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      fetch(api('/dsh-market/restart'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
         .then(res => res.json().then(body => ({ status: res.status, body })))
         .then(({ status, body }) => {
           if (status === 202 && body.ok === true) {
@@ -1852,7 +2043,7 @@ export function MarketSection(props: MarketSectionProps) {
 
   /** Cancel the running plugin command (#6 by @qichuang321). */
   const doCancel = useCallback(() => {
-    fetch('/dsh-market/cancel', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+    fetch(api('/dsh-market/cancel'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
       .catch(() => {})
   }, [])
 
@@ -1879,7 +2070,7 @@ export function MarketSection(props: MarketSectionProps) {
     // (#295 by @sanyecao88). One record per attempt, like the install flow.
     const updateRecordId = nextRecordId()
     setRecords(list => enqueue(list, { id: updateRecordId, kind: 'update', name, state: 'running' }))
-    return fetch('/dsh-market/update', {
+    return fetch(api('/dsh-market/update'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name, ...(force ? { force: true } : {}), ...(restore ? { restore: true } : {}) }),
@@ -1926,7 +2117,21 @@ export function MarketSection(props: MarketSectionProps) {
             setBuildsSkipped({ updateName: name, names: body.ignoredBuilds.map(String), restore })
           }
           const text = (v: unknown) => typeof v === 'string' ? v : (v && typeof (v as any).text === 'string') ? (v as any).text : v == null ? '' : JSON.stringify(v)
-          const detail = text(body.error) || humanOutput([text(body.stderr), text(body.stdout)].filter(Boolean).join('\n')) || ('exit ' + body.exitCode)
+          const orphans = Array.isArray(body.orphanBundles) ? body.orphanBundles.map(String) : []
+          const failure = text(body.error) || humanOutput([text(body.stderr), text(body.stdout)].filter(Boolean).join('\n')) || ('exit ' + body.exitCode)
+          // The profile will not boot as it stands (#339). Said FIRST, because
+          // it outranks whatever else went wrong: a plugin that failed to
+          // install is recoverable, a profile that cannot start is not — and
+          // the user would otherwise meet it as a Node stack trace after the
+          // next restart, with nothing linking it to this operation.
+          // A stale catalog entry (#346) is said before pnpm's own wording,
+          // which for that failure reads like the user broke something.
+          const staleEntry = typeof body.staleEntry === 'string' ? body.staleEntry : null
+          const detail = [
+            orphans.length > 0 ? `${t('orphanBundle')} ${orphans.join(', ')}` : null,
+            staleEntry,
+            failure,
+          ].filter(Boolean).join('\n')
           setRecords(list => patchRecord(list, updateRecordId, { state: 'failed', reason: detail.trim().slice(-600) }))
           setInstallError((restore ? t('restoreFail') : t('updateFail')) + ': ' + name + ' — ' + detail.trim().slice(-600))
         }
@@ -1954,9 +2159,22 @@ export function MarketSection(props: MarketSectionProps) {
     setInstallError(t('restoreHint'))
   }, [data, installed, repoHints, repoIdentities, t])
 
-  const doUseSkin = useCallback((name: string) => {
-    setInstallError(null)
-    fetch('/dsh-market/use-skin', {
+  /** Open the update-notes dialog and start its fetch. Lazy: the request only
+      exists while a user is actually looking at one plugin's notes, and
+      closing the dialog abandons the render — the server side caches the
+      payload, so reopening is cheap. */
+  const openNotes = useCallback((name: string, current: string | null, latest: string | null, repoUrl: string | null) => {
+    setNotesFor({ name, current, latest, repoUrl })
+    setUpdateNotes(null)
+    setNotesState('loading')
+    fetch(`/dsh-market/changelog?name=${encodeURIComponent(name)}`)
+      .then(res => res.json())
+      .then(body => { setUpdateNotes(body as ResolvedNotes); setNotesState('ready') })
+      .catch(() => setNotesState('fail'))
+  }, [])
+
+  const doUseSkin = useCallback((name: string) => {    setInstallError(null)
+    fetch(api('/dsh-market/use-skin'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name }),
@@ -1975,12 +2193,43 @@ export function MarketSection(props: MarketSectionProps) {
       .catch(error => setInstallError(String(error)))
   }, [])
 
+  /**
+   * Forget a pending page-refresh for a plugin that is no longer here.
+   *
+   * The banner counts what the page has not caught up with. Install then
+   * uninstall and the page is level again — there is nothing left to load —
+   * but both sets were append-only, so it kept asking for a refresh that
+   * would show nothing (#340). It conflated "something needs doing" with
+   * "something happened in this session".
+   */
+  /** Write (or clear, when empty) this plugin's note. */
+  const saveNote = useCallback((name: string, text: string) => {
+    setNotingName(null)
+    fetch('/dsh-market/note', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, text }),
+    })
+      .then(res => res.json())
+      .then((body) => {
+        if (body.ok && body.notes !== null && typeof body.notes === 'object') {
+          setNotes(body.notes as Record<string, string>)
+        } else setInstallError(String(body.error || 'note failed'))
+      })
+      .catch(error => setInstallError(String(error)))
+  }, [])
+
+  const clearPendingRefresh = useCallback((name: string) => {
+    setHotNames(names => names.filter(entry => entry !== name))
+    setRefreshNames(names => names.filter(entry => entry !== name))
+  }, [])
+
   const doUninstall = useCallback((name: string) => {
     setRemoveConfirm(null)
     setInstallError(null)
     setActivationWarnings([])
     setRemovingName(name)
-    return fetch('/dsh-market/uninstall', {
+    return fetch(api('/dsh-market/uninstall'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name }),
@@ -1989,6 +2238,7 @@ export function MarketSection(props: MarketSectionProps) {
       .then(({ status, body }) => {
         if (status === 200 && body.ok) {
           if (!body.hot) setRemovedCount(n => n + 1)
+          clearPendingRefresh(name)
           refreshInstalled()
         } else {
           if (body.cancelled === true) {
@@ -2003,6 +2253,7 @@ export function MarketSection(props: MarketSectionProps) {
           // (removed, profile synced) from the process (pnpm errored).
           if (body.reconciled === true) {
             if (!body.hot) setRemovedCount(n => n + 1)
+            clearPendingRefresh(name)
             refreshInstalled()
             setInstallError(t('reconciledNote'))
             return
@@ -2021,7 +2272,7 @@ export function MarketSection(props: MarketSectionProps) {
   const doToggle = useCallback((name: string, enabled: boolean, reload = false) => {
     setTogglingName(name)
     setInstallError(null)
-    return fetch('/dsh-market/toggle', {
+    return fetch(api('/dsh-market/toggle'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name, enabled }),
@@ -2039,7 +2290,14 @@ export function MarketSection(props: MarketSectionProps) {
           if (body.restart === true) setToggleRestart(n => n + 1)
           // A client-part plugin's UI is already in the page — refresh to
           // show the change (mirrors the install hot banner).
-          if (body.refresh === true) setRefreshNames(names => names.includes(name) ? names : names.concat(name))
+          // Back to the position the page was rendered with means there is
+          // nothing left for a refresh to show, so the banner drops it
+          // instead of counting the round trip as a pending change (#340).
+          if (body.refresh === true) {
+            const wasDisabled = loadedDisabled.current?.has(name) ?? false
+            if (wasDisabled === !enabled) clearPendingRefresh(name)
+            else setRefreshNames(names => names.includes(name) ? names : names.concat(name))
+          }
           // Not on the reload path: the page is about to go away, and the
           // theme flow lands its own toast on the other side.
           if (!reload) setToggled({ name, enabled })
@@ -2065,7 +2323,7 @@ export function MarketSection(props: MarketSectionProps) {
       })
       .catch(error => setInstallError(String(error)))
       .finally(() => setTogglingName(null))
-  }, [refreshInstalled, t])
+  }, [clearPendingRefresh, refreshInstalled, t])
 
   /** Adopt the groups payload returned by POST /dsh-market/groups. */
   const setGroupPayload = useCallback((body: {
@@ -2081,7 +2339,7 @@ export function MarketSection(props: MarketSectionProps) {
   /** One POST /dsh-market/groups round trip (create/rename/delete/members/toggle). */
   const doGroupAction = useCallback((payload: Record<string, unknown>): Promise<boolean> => {
     setInstallError(null)
-    return fetch('/dsh-market/groups', {
+    return fetch(api('/dsh-market/groups'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -2119,7 +2377,7 @@ export function MarketSection(props: MarketSectionProps) {
     names: string[],
     resume: () => void,
   ) => {
-    fetch('/dsh-market/approve-builds', {
+    fetch(api('/dsh-market/approve-builds'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ packages: names }),
@@ -2260,7 +2518,7 @@ export function MarketSection(props: MarketSectionProps) {
     setBackupBusy(true)
     setBackupMessage(null)
     setRestoreErrors([])
-    return fetch('/dsh-market/restore', {
+    return fetch(api('/dsh-market/restore'), {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backup: pendingBackup }),
     }).then(async response => {
       const body = await response.json()
@@ -2274,7 +2532,7 @@ export function MarketSection(props: MarketSectionProps) {
     setBackupBusy(true)
     setBackupMessage(null)
     setRestoreErrors([])
-    fetch('/dsh-market/webdav', {
+    fetch(api('/dsh-market/webdav'), {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ action, url: webdavUrl.trim(), username: webdavUser, password: webdavPassword }),
     }).then(async response => {
@@ -2344,7 +2602,7 @@ export function MarketSection(props: MarketSectionProps) {
         if (exportIncludeConfig) body.includeConfig = true
       }
     }
-    fetch('/dsh-market/gist', {
+    fetch(api('/dsh-market/gist'), {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
       // Fallback ceiling only — the server answers structured errors (with a
       // code) within 25 s, so a wedged host cannot leave the user staring at
@@ -2563,6 +2821,13 @@ export function MarketSection(props: MarketSectionProps) {
               date/tag pair alone was long enough in English to wrap onto its
               own line, splitting one card's footer into two visual rows. */}
           <span className={css.grow} />
+          {/* No comment count here. Showing one would mean asking giscus about
+              every card on the page just to render a number, and a row of
+              zeroes reads as "nobody uses these" on a catalog where almost
+              nothing has been commented on yet. */}
+          <button type="button" className={css.commentsLink} onClick={() => setCommentsFor(p)}>
+            {t('comments')}
+          </button>
         </div>
         {busy && (
           <div className={css.progress}>
@@ -3140,7 +3405,7 @@ export function MarketSection(props: MarketSectionProps) {
                       size="sm"
                       icon={<IconDownloadOutline16 size={14} />}
                       disabled={backupBusy}
-                      onClick={() => downloadFile('/dsh-market/backup', 'dsh-profile-backup.json')}
+                      onClick={() => downloadFile(api('/dsh-market/backup'), 'dsh-profile-backup.json')}
                     >{backupBusy ? t('backupWorking') : t('backupDownload')}</Button>
                     <Button
                       variant="outline"
@@ -3635,7 +3900,7 @@ export function MarketSection(props: MarketSectionProps) {
                                         beside it pointed at the same page. */}
                                     <span className={css.irowNameText}>
                                       {repoUrl !== null
-                                        ? <a className={css.nameLink} href={repoUrl + '#readme'} target="_blank" rel="noreferrer" title={t('readme')}>{name}</a>
+                                        ? <a className={css.nameLink} href={repoUrl + '#readme'} target="_blank" rel="noreferrer" title={name} aria-label={`${name} — ${t('readme')}`}>{name}</a>
                                         : name}
                                     </span>
                                     {entry?.deprecated === true && <span className={css.depBadge}>{t('deprecatedBadge')}</span>}
@@ -3646,10 +3911,73 @@ export function MarketSection(props: MarketSectionProps) {
                                     : repoUrl !== null
                                       ? <a className={`${css.spec} ${css.src}`} href={repoUrl} target="_blank" rel="noreferrer" style={{ display: 'inline-block' }}>{specText}</a>
                                       : <div className={css.spec}>{specText}</div>}
-                                  {entry !== undefined && (
-                                    <div className={`${css.desc} ${css.descTight}`}>
-                                      {(entry.description && (entry.description[lang] || entry.description.en)) || ''}
-                                    </div>
+                                  {/* The user's own note REPLACES the author's
+                                      description (#347): a catalog blurb answers
+                                      "what is this", written for strangers and
+                                      often not in the reader's language, and
+                                      cannot answer "why did I install this" —
+                                      which is what someone with forty plugins
+                                      is asking. The original stays one click
+                                      away rather than being lost. */}
+                                  {notingName === name
+                                    ? (
+                                        <div className={css.noteEdit}>
+                                          <Input
+                                            className={css.noteInput}
+                                            value={noteDraft}
+                                            maxLength={200}
+                                            autoFocus
+                                            placeholder={t('notePlaceholder')}
+                                            onChange={e => setNoteDraft(e.target.value)}
+                                            onKeyDown={(e) => {
+                                              if (e.key === 'Enter') saveNote(name, noteDraft)
+                                              if (e.key === 'Escape') setNotingName(null)
+                                            }}
+                                          />
+                                          <Button variant="outline" size="sm" onClick={() => saveNote(name, noteDraft)}>{t('noteSave')}</Button>
+                                          <Button variant="ghost" size="sm" onClick={() => setNotingName(null)}>{t('cancel')}</Button>
+                                        </div>
+                                      )
+                                    : (() => {
+                                        const note = notes[name]
+                                        const authored = (entry?.description && (entry.description[lang] || entry.description.en)) || ''
+                                        const theirs = showTheirs.includes(name)
+                                        const shown = note !== undefined && !theirs ? note : authored
+                                        if (shown === '' && note === undefined) return null
+                                        return (
+                                          <div className={`${css.desc} ${css.descTight} ${css.noteRow}`}>
+                                            <span className={note !== undefined && !theirs ? css.noteMine : undefined}>{shown}</span>
+                                            {note !== undefined && authored !== '' && (
+                                              <button
+                                                type="button"
+                                                className={css.noteToggle}
+                                                title={theirs ? t('noteSeeMine') : t('noteSeeTheirs')}
+                                                aria-label={theirs ? t('noteSeeMine') : t('noteSeeTheirs')}
+                                                onClick={() => setShowTheirs(list => theirs ? list.filter(n => n !== name) : list.concat(name))}
+                                              >{theirs ? t('noteMine') : t('noteTheirs')}</button>
+                                            )}
+                                            <button
+                                              type="button"
+                                              className={css.noteToggle}
+                                              title={note === undefined ? t('noteAdd') : t('noteEdit')}
+                                              aria-label={note === undefined ? t('noteAdd') : t('noteEdit')}
+                                              onClick={() => { setNoteDraft(note ?? ''); setNotingName(name) }}
+                                            >{note === undefined ? t('noteAdd') : t('noteEdit')}</button>
+                                          </div>
+                                        )
+                                      })()}
+                                  {/* Update-notes entry (#294). Only a row with an
+                                      update pending renders it — a plugin that is
+                                      up to date has nothing to preview — and it is
+                                      one quiet line in the flow the row already
+                                      reserves for conditional content, so rows
+                                      without it are pixel-identical to before. */}
+                                  {status !== undefined && status.updateAvailable && (
+                                    <button
+                                      type="button"
+                                      className={css.notesLink}
+                                      onClick={() => openNotes(name, status.current ?? null, status.latest ?? null, repoUrl)}
+                                    >{`▸ ${t('notesLink')}`}</button>
                                   )}
                                   {!off && act !== undefined && meta !== null && (
                                         <div className={css.act}>
@@ -3902,6 +4230,16 @@ export function MarketSection(props: MarketSectionProps) {
           <p className={css.modalNote}><IconWarningOutline16 size={14} className={css.bannerIcon} />{' ' + t('confirmWarn')}</p>
         </Modal>
       )}
+      {commentsFor !== null && (
+        <CommentsModal
+          key={commentsFor.url}
+          name={pluginName(commentsFor.name)}
+          url={commentsFor.url}
+          lang={lang}
+          onClose={() => setCommentsFor(null)}
+          t={t}
+        />
+      )}
       {lightbox !== null && (
         <ScreenshotLightbox
           shots={lightbox.shots}
@@ -3923,6 +4261,92 @@ export function MarketSection(props: MarketSectionProps) {
             </>
           )}
         />
+      )}
+      {notesFor !== null && (
+        <Modal
+          open
+          onClose={() => setNotesFor(null)}
+          /* The host's Modal renders its title node verbatim; the hand-written
+             primitives.d.ts narrows the prop to string, so this cast documents
+             intent rather than defeating a runtime check. */
+          title={(notesFor.repoUrl !== null
+            ? <a className={css.nameLink} href={notesFor.repoUrl + '#readme'} target="_blank" rel="noreferrer">{notesFor.name}</a>
+            : notesFor.name) as unknown as string}
+          footer={(
+            <Button variant="ghost" onClick={() => setNotesFor(null)}>{t('cancel')}</Button>
+          )}
+        >
+          {/* The version line reads as versions when both ends are semver and
+              as short shas when the plugin updates from git — a 40-char sha
+              pair wraps the dialog into nonsense. */}
+          {(notesFor.current !== null || notesFor.latest !== null) && (
+            <div className={css.notesRange}>
+              <span className={css.spec}>{notesFor.current !== null && notesFor.current.length === 40
+                ? notesFor.current.slice(0, 7)
+                : notesFor.current}</span>
+              <span className={css.notesArrow}>→</span>
+              <span className={css.spec}>{notesFor.latest !== null && notesFor.latest.length === 40
+                ? notesFor.latest.slice(0, 7)
+                : notesFor.latest}</span>
+            </div>
+          )}
+          {notesState === 'loading' && <div className={css.spec}>{t('loading')}</div>}
+          {notesState === 'fail' && <div className={css.spec}>{t('notesLoadFail')}</div>}
+          {notesState === 'ready' && updateNotes !== null && (
+            updateNotes.kind === 'release' ? (
+              <div className={css.notesBody}>
+                <div className={css.notesMeta}>
+                  <strong>{t('notesRelease')}</strong>
+                  {updateNotes.release.tag !== null && <span>{' ' + updateNotes.release.tag}</span>}
+                  {updateNotes.release.publishedAt !== null && <span>{' · ' + updateNotes.release.publishedAt.slice(0, 10)}</span>}
+                </div>
+                {/* Author-written markdown, rendered through a deliberately
+                    tiny converter: everything lands as React text children
+                    (auto-escaped), so no HTML from the repo can ever become
+                    markup — headings, bullets, bold and inline code only. */}
+                <div className={css.notesRendered}>{renderMarkdown(updateNotes.release.body || t('notesNone'))}</div>
+              </div>
+            )
+            : updateNotes.kind === 'commits' ? (
+              <div className={css.notesBody}>
+                <div className={css.notesMeta}><strong>{t('notesCommits')}</strong></div>
+                {!updateNotes.commits.found && <div className={css.notesMeta}>{t('notesCommitsRecent')}</div>}
+                <ul className={css.notesList}>
+                  {updateNotes.commits.items.map(c => (
+                    <li key={c.sha} className={css.notesRow}>
+                      <span className={css.notesDate}>{c.date !== null ? c.date.slice(0, 10) : ''}</span>
+                      <span className={css.notesMsg}>{mdInline(c.message)}</span>
+                      {notesFor.repoUrl !== null && (
+                        /* The commit itself on GitHub — the escape hatch when
+                           two lines of clamp hide exactly the detail wanted. */
+                        <a className={css.notesSha}
+                          href={notesFor.repoUrl + '/commit/' + c.sha}
+                          target="_blank" rel="noreferrer"
+                          title={c.message}>{c.sha.slice(0, 7)}</a>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )
+            : updateNotes.kind === 'npm' ? (
+              <div className={css.notesBody}>
+                <div className={css.notesMeta}><strong>{t('notesNpm')}</strong></div>
+                <ul className={css.notesList}>
+                  {updateNotes.npmTimes.map(v => (
+                    <li key={v.version} className={css.notesRow}>
+                      <span className={css.notesDate}>{v.date.slice(0, 10)}</span>
+                      <a className={css.notesVer}
+                        href={`https://www.npmjs.com/package/${encodeURIComponent(notesFor.name)}/v/${encodeURIComponent(v.version)}`}
+                        target="_blank" rel="noreferrer">{v.version}</a>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )
+            : <div className={css.spec}>{t('notesNone')}</div>
+          )}
+        </Modal>
       )}
       {restoreConfirmOpen && pendingBackup !== null && (
         <Modal

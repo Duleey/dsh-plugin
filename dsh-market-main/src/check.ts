@@ -59,6 +59,12 @@ export interface BundleLayer {
   directory: string | null
   /** Absolute path of the layer's patch file; null when undeclared/missing. */
   patchPath: string | null
+  /**
+   * An in-box bundle whose directory could not be located — a gap in what
+   * this process can see, not a defect in the profile (#369). Distinct from
+   * `error`, which asserts the profile will not boot.
+   */
+  unresolvedInbox?: boolean
   /** Why this layer cannot load at boot (missing dir / no dsh.bundle / …). */
   error: string | null
   /** Loader entry ids this bundle's patch inserts. */
@@ -373,15 +379,29 @@ function readNodeModulesVersion(base: string, name: string): string | null {
  * hoisting (`<profiles>/node_modules/…` when the profile lives under
  * `<profiles>/<name>`) and mirrors the Loader's package search roots.
  */
-function resolvePackageDir(anchorPackageJson: string, name: string): string | null {
+function resolvePackageDir(
+  anchorPackageJson: string,
+  name: string,
+  ignoredPackageDirectory?: string,
+): string | null {
   let paths: string[] = []
   try {
     paths = createRequire(anchorPackageJson).resolve.paths(name) ?? []
   } catch {
     return null
   }
+  const ignored = ignoredPackageDirectory === undefined
+    ? null
+    : resolve(ignoredPackageDirectory)
   for (const searchPath of paths) {
     const candidate = join(searchPath, name)
+    if (ignored !== null) {
+      const resolvedCandidate = resolve(candidate)
+      const matchesIgnored = process.platform === 'win32'
+        ? resolvedCandidate.toLowerCase() === ignored.toLowerCase()
+        : resolvedCandidate === ignored
+      if (matchesIgnored) continue
+    }
     if (existsSync(join(candidate, 'package.json'))) return candidate
   }
   return null
@@ -878,14 +898,26 @@ export function buildBundleLayers(
   dshInstallDir: string | null,
 ): { bundles: BundleLayer[]; layers: LayerInput[] } {
   const bundles: BundleLayer[] = bundleNames.map((name) => {
-    const anchors = [
-      dshInstallDir !== null ? join(dshInstallDir, 'package.json') : null,
-      join(profileDirectory, 'package.json'),
+    // The real loader gives the DSH installation first refusal for in-box
+    // bundles. Desktop keeps that installation private from plugins, so a
+    // DIRECT profile-local copy with the same official name is only a stale
+    // shadow, never evidence for the layer the running host loaded (#371).
+    // Keep walking the profile anchor's parent search paths: Desktop heals an
+    // authoritative host fallback at <profiles>/node_modules.
+    const ignoredProfilePackage = dshInstallDir === null && INBOX_BUNDLES.has(name)
+      ? join(profileDirectory, 'node_modules', name)
+      : undefined
+    const anchors: Array<{ anchor: string | null; ignoredPackageDirectory?: string }> = [
+      { anchor: dshInstallDir !== null ? join(dshInstallDir, 'package.json') : null },
+      {
+        anchor: join(profileDirectory, 'package.json'),
+        ignoredPackageDirectory: ignoredProfilePackage,
+      },
     ]
     let directory: string | null = null
-    for (const anchor of anchors) {
+    for (const { anchor, ignoredPackageDirectory } of anchors) {
       if (anchor === null) continue
-      directory = resolvePackageDir(anchor, name)
+      directory = resolvePackageDir(anchor, name, ignoredPackageDirectory)
       if (directory !== null) break
     }
     const layer: BundleLayer = {
@@ -899,6 +931,22 @@ export function buildBundleLayers(
       parseError: null,
     }
     if (directory === null) {
+      // An in-box bundle is supplied by the dsh INSTALLATION, not by the
+      // profile — that is what makes it in-box. So failing to find one says
+      // we could not locate the installation, not that the profile is
+      // broken: on DSH Desktop dsh lives inside the app bundle and
+      // findDshInstallDir() walks up from process.argv[1], which is
+      // Electron's entry and leads nowhere near it.
+      //
+      // Calling that "will fail to boot" turned a working composition into a
+      // fatal verdict and rolled back a good update (#369) — while `dsh
+      // --dump-config` on the same profile exited 0. Unknown has to read as
+      // unknown; the profile's own bundles are still judged normally.
+      if (INBOX_BUNDLES.has(name)) {
+        layer.error = null
+        layer.unresolvedInbox = true
+        return layer
+      }
       layer.error = 'bundle package is not installed — the profile will fail to boot'
       return layer
     }

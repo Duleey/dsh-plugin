@@ -168,7 +168,7 @@
 .themeStatus,.themeStatusMuted{flex:none;display:inline-flex;align-items:center;min-height:22px;padding:0 8px;border-radius:4px;font-size:11px;font-weight:600;white-space:nowrap}
 .themeStatus{background:var(--dsw-alias-state-success-tertiary,rgba(22,163,74,.1));color:var(--dsw-alias-state-success-primary,#15803d)}
 .themeStatusMuted{background:var(--dsw-alias-bg-layer-2,#f3f4f6);color:var(--dsw-alias-label-secondary,#6b7280)}
-.themeDescription{display:-webkit-box;min-height:36px;margin:0;overflow:hidden;color:var(--dsw-alias-label-tertiary,#8b93a1);font-size:12px;line-height:18px;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+.themeDescription{display:-webkit-box;min-height:36px;margin:0;overflow:hidden;color:var(--dsw-alias-label-tertiary,#8b93a1);font-size:12px;line-height:18px;-webkit-box-orient:vertical;-webkit-line-clamp:3}
 .themeCardFooter{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:auto;padding-top:4px}
 .themeLifecycle{min-width:0;overflow:hidden;color:var(--dsw-alias-label-tertiary,#8b93a1);font-size:11px;line-height:18px;text-overflow:ellipsis;white-space:nowrap}
 .themeActions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;margin-left:auto}
@@ -287,6 +287,17 @@
 .version{font-size:12px;line-height:20px;color:var(--dsw-alias-label-tertiary,#8b93a1);font-variant-numeric:tabular-nums;flex-shrink:0}
 .repoLink{font-size:12px;line-height:20px;color:var(--dsw-alias-label-tertiary,#8b93a1);text-decoration:none;flex-shrink:0}
 .repoLink:hover{color:var(--dsw-alias-brand-primary,#4f6ef7)}
+/* The note row (#347). The user's own text reads as theirs — slightly
+   stronger than a catalog blurb, which is the point: it is the line they
+   wrote for themselves. The two affordances are quiet text rather than
+   icons because the icon set this package can actually resolve carries no
+   edit or view glyph, and a wrong icon is worse than a short word. */
+.noteRow{display:flex;align-items:baseline;gap:6px;min-width:0;flex-wrap:wrap}
+.noteMine{color:var(--dsw-alias-label-primary,#1f2328)}
+.noteToggle{font:inherit;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#8b93a1);background:0 0;border:none;padding:0;cursor:pointer;flex-shrink:0;white-space:nowrap}
+.noteToggle:hover{color:var(--dsw-alias-brand-primary,#4f6ef7);text-decoration:underline}
+.noteEdit{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap;margin-top:2px}
+.noteInput{flex:1;min-width:160px}
 .descTight{min-height:0}
 .src{font-size:11px;color:var(--dsw-alias-label-secondary,#9ca3af);text-decoration:none}
 .src:hover{color:var(--dsw-alias-brand-primary,#4f6ef7)}
@@ -414,8 +425,16 @@
    so it never truncates; the name is the variable-length part and is the
    only thing allowed to shrink and ellipsize (#257). Scoped to this row
    rather than added to `.nm`, which six other surfaces share. */
-.irowName{display:flex;align-items:baseline;gap:6px;min-width:0;overflow:visible;text-overflow:clip}
-.irowNameText{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Wraps rather than truncates (#342, #343). A scoped package name is the
+   thing that tells two installed plugins apart — `@deepseek-ai/dsh-client-ui-…`
+   and `@dsh-external/dsh-sessi…` are both just prefixes — and an ellipsis
+   removes exactly the end that distinguishes them. Wrapping costs a line only
+   on the names long enough to need one, and the installed list is a masonry,
+   so a taller row does not push its neighbours around.
+   `anywhere` rather than `break-word`: these names have long unbroken runs
+   between the slash and the dashes, which `break-word` leaves overflowing. */
+.irowName{display:flex;align-items:baseline;gap:6px;min-width:0;overflow:visible;text-overflow:clip;flex-wrap:wrap}
+.irowNameText{min-width:0;overflow-wrap:anywhere;white-space:normal}
 .irowName>.owner{flex:0 0 auto}
 .nameLink:hover{color:var(--dsw-alias-brand-primary,#4f6ef7);text-decoration:underline}
 .opWrap{position:relative;display:inline-flex;flex-shrink:0}
@@ -654,3 +673,52 @@
 .setSegBtn:disabled{cursor:default;opacity:.5}
 .setSegOn{background:var(--dsw-alias-bg-layer-2,#eef0f4);color:var(--dsw-alias-label-primary,#1f2328);font-weight:600}
 .setBetaTag{margin-left:6px;padding:0 6px;border-radius:9px;font-size:11px;font-weight:600;line-height:17px;background:var(--dsw-alias-bg-module-platform,#eef0f4);color:var(--dsw-alias-label-secondary,#6b7280)}
+
+/* ---------------------------------------------------------- comments */
+/* Card footer entry point. Styled as the quiet sibling of .src, not as a
+   button: it competes with Install for attention otherwise, and Install is
+   what the card is for. */
+.commentsLink{background:none;border:0;padding:0;cursor:pointer;font-size:11px;line-height:16px;white-space:nowrap;color:var(--dsw-alias-label-secondary,#9ca3af)}
+.commentsLink:hover{color:var(--dsw-alias-brand-primary,#4f6ef7)}
+.commentsNote{font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary,#9ca3af);margin:0 0 8px}
+.commentsStatus{font-size:12px;color:var(--dsw-alias-label-secondary,#9ca3af);margin:0}
+.commentsStatus:empty{display:none}
+.commentsError{font-size:12px;color:var(--dsw-alias-label-primary,#1f2328);margin:0 0 8px}
+.commentsFail{display:flex;flex-direction:column;align-items:flex-start;gap:8px;padding:12px 0}
+/* The iframe reports its own height once giscus has the thread. Holding room
+   until then keeps the modal from snapping open to full size a beat after the
+   reader has already started looking at it. */
+/* The host owns the dialog's width and does not let a plugin change it, so the
+   thread is fitted to that width rather than overflowing a box that clips.
+   giscus lays out fine this narrow — it is the width it uses on phones. */
+.commentsMount{width:100%;min-height:240px;max-height:56vh;overflow:auto}
+.commentsMount iframe{width:100%}
+/* Update-notes entry + dialog (#294). The entry is a text button, not a
+   Button component: it must read as content in the row's flow rather than as
+   an action competing with 更新/卸载 on the trailing edge. */
+.notesLink{display:block;background:0 0;border:none;padding:0;margin:2px 0 0;font:inherit;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#6b7280);cursor:pointer;text-align:left}
+.notesLink:hover{color:var(--dsw-alias-label-primary,#1f2328)}
+.notesBody{display:flex;flex-direction:column;gap:8px;min-width:0}
+/* 弹窗内的层级：范围行弱化、区块标题小而重、正文有承载面 */
+.notesRange{display:flex;align-items:center;gap:8px;font-size:12px;line-height:18px;margin-bottom:4px}
+.notesArrow{color:var(--dsw-alias-label-tertiary,#8b93a1)}
+.notesMeta{font-size:12px;line-height:18px;letter-spacing:.02em;text-transform:uppercase;color:var(--dsw-alias-label-secondary,#6b7280);display:flex;gap:6px;flex-wrap:wrap;align-items:baseline;margin-top:12px}
+.notesPre{margin:0;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:20px;padding:10px 12px;background:var(--dsw-alias-bg-layer-2,#eef0f4);border-radius:8px;max-height:40vh;overflow:auto}
+.notesList{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px;font-size:13px;line-height:20px}
+/* markdown轻渲染的层级：标题、段落、行内代码 */
+.notesRendered{display:flex;flex-direction:column;gap:6px;min-width:0}
+.notesH{font-size:13px;font-weight:650;line-height:20px;margin-top:6px}
+.notesP{font-size:13px;line-height:20px}
+.notesCode{font-family:var(--dsw-alias-font-mono,ui-monospace,monospace);font-size:12px;padding:1px 5px;border-radius:5px;background:var(--dsw-alias-bg-layer-2,#eef0f4)}
+/* 列表行：日期一列弱化对齐，内容一列自适应换行 */
+.notesList{margin:0;padding:0;list-style:none;display:flex;flex-direction:column}
+.notesRow{display:flex;gap:12px;align-items:baseline;padding:6px 0;border-bottom:1px solid var(--dsw-alias-border-l2,#e5e7eb)}
+.notesRow:last-child{border-bottom:none}
+.notesDate{flex-shrink:0;color:var(--dsw-alias-label-tertiary,#8b93a1);font-size:12px;font-variant-numeric:tabular-nums}
+.notesMsg{min-width:0;word-break:break-word;font-size:13px;line-height:20px}
+/* commit行：消息限高两行，短sha右对齐可点 */
+.notesMsg{min-width:0;word-break:break-word;font-size:13px;line-height:20px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.notesSha{margin-left:auto;flex-shrink:0;font-size:12px;color:var(--dsw-alias-label-secondary,#6b7280);text-decoration:none;font-variant-numeric:tabular-nums}
+.notesSha:hover{color:var(--dsw-alias-label-primary,#1f2328);text-decoration:underline}
+.notesVer{color:inherit;text-decoration:none;font-weight:600}
+.notesVer:hover{text-decoration:underline}

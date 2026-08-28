@@ -34,6 +34,8 @@ const fake = vi.hoisted(() => ({
   tarballs: {} as Record<string, { name: string; manifest: unknown; artifacts?: string[] }>,
   /** Simulate pnpm minimumReleaseAge: adds resolve to the ALREADY INSTALLED version, exit 0. */
   staleUpdates: false,
+  /** Resolve the next npm add to this version even though the dist-tag points elsewhere. */
+  resolvedNpmVersionOnce: null as string | null,
   /** Fail the next N mutating commands with the hoist-pattern drift error. */
   hoistDiffTimes: 0,
   /** Simulate a too-young release in the lockfile (#39): every mutation
@@ -67,6 +69,8 @@ const fake = vi.hoisted(() => ({
    * is written before registry fetches and the build-script check run.
    */
   failAfterWriteStderrOnce: '',
+  /** Simulate dsh adding a profile bundle before that same add later fails (#339). */
+  profileBundleOnNextAdd: null as string | null,
   /** Make restore's bulk install fail so its per-plugin fallback is exercised. */
   failInstallOnce: false,
   captureBundlesOnNextAdd: false,
@@ -91,7 +95,10 @@ vi.mock('../src/dsh-cli.ts', () => {
       writeFileSync(join(root, rel), artifactContents[rel] ?? '')
     }
   }
-  function readManifest(): { dependencies?: Record<string, string> } {
+  function readManifest(): {
+    dependencies?: Record<string, string>
+    dsh?: { profile?: { bundles?: string[] } }
+  } {
     return JSON.parse(readFileSync(join(fake.profileDir, 'package.json'), 'utf8'))
   }
   function writeLockCommit(repo: string, commit: string): void {
@@ -105,6 +112,14 @@ vi.mock('../src/dsh-cli.ts', () => {
   function writeDep(name: string, spec: string): void {
     const manifest = readManifest()
     manifest.dependencies = { ...manifest.dependencies, [name]: spec }
+    writeFileSync(join(fake.profileDir, 'package.json'), JSON.stringify(manifest))
+  }
+  function appendProfileBundle(name: string): void {
+    const manifest = readManifest()
+    manifest.dsh ??= {}
+    manifest.dsh.profile ??= {}
+    const bundles = manifest.dsh.profile.bundles ?? []
+    if (!bundles.includes(name)) manifest.dsh.profile.bundles = [...bundles, name]
     writeFileSync(join(fake.profileDir, 'package.json'), JSON.stringify(manifest))
   }
   function removeDep(name: string): void {
@@ -198,6 +213,19 @@ vi.mock('../src/dsh-cli.ts', () => {
       writePkg(repo.name, def?.manifest ?? repo.manifest, def?.artifacts ?? repo.artifacts)
       const nextCommit = commit ?? repo.lockCommit
       if (nextCommit !== undefined) writeLockCommit(repoKey.replace(/^github:/, ''), nextCommit)
+      // `dsh plugin add` writes the bundle row on this path too — that is
+      // where #339 came from, a github-sourced install whose build was
+      // blocked. Consuming the flag only in the npm branch below let the
+      // regression test pass without ever creating the orphan it asserts on.
+      if (fake.profileBundleOnNextAdd !== null) {
+        appendProfileBundle(fake.profileBundleOnNextAdd)
+        fake.profileBundleOnNextAdd = null
+      }
+      if (fake.failAfterWriteStderrOnce !== '') {
+        const stderr = fake.failAfterWriteStderrOnce
+        fake.failAfterWriteStderrOnce = ''
+        return { exitCode: 1, timedOut: false, stdout: '', stderr, cancelled: false }
+      }
       for (const child of repo.junkChildren ?? []) {
         mkdirSync(join(fake.profileDir, 'node_modules', repo.name, child), { recursive: true })
         writeFileSync(join(fake.profileDir, 'node_modules', repo.name, child, 'package.json'), '{"dsh":{}}')
@@ -221,9 +249,14 @@ vi.mock('../src/dsh-cli.ts', () => {
       // pnpm minimumReleaseAge: "Already up to date", old version kept, exit 0.
       return ok
     }
-    const version = pkg.latest
+    const version = fake.resolvedNpmVersionOnce ?? pkg.latest
+    fake.resolvedNpmVersionOnce = null
     writeDep(name, `^${version}`)
     writePkg(name, { version, ...(pkg.versions[version].manifest as object) }, pkg.versions[version].artifacts, pkg.versions[version].artifactContents)
+    if (fake.profileBundleOnNextAdd !== null) {
+      appendProfileBundle(fake.profileBundleOnNextAdd)
+      fake.profileBundleOnNextAdd = null
+    }
     if (fake.failAfterWriteStderrOnce !== '') {
       const stderr = fake.failAfterWriteStderrOnce
       fake.failAfterWriteStderrOnce = ''
@@ -411,7 +444,7 @@ function createTestbed(
     await handler(request, response)
     let json: any = null
     try { json = JSON.parse(payload) } catch { /* non-JSON (logs route) */ }
-    return { status, json }
+    return { status, json, text: payload }
   }
   return { dispatch, loaderEntries, dispose }
 }
@@ -431,6 +464,7 @@ beforeEach(() => {
   fake.npm = {}
   fake.repos = {}
   fake.staleUpdates = false
+  fake.resolvedNpmVersionOnce = null
   fake.hoistDiffTimes = 0
   fake.youngLockfile = false
   fake.gate = null
@@ -438,6 +472,7 @@ beforeEach(() => {
   fake.buildScriptOutputOnce = ''
   fake.failNextAddStderrOnce = ''
   fake.failAfterWriteStderrOnce = ''
+  fake.profileBundleOnNextAdd = null
   fake.failInstallOnce = false
   fake.captureBundlesOnNextAdd = false
   fake.bundlesBeforeFallbackAdd = null
@@ -673,6 +708,56 @@ describe('backup and restore (#55)', () => {
     expect(restored.json.bootErrors).toBeUndefined()
   })
 
+  /** #341: the log buffer dies with the process, so a failure that only
+   * appears after a restart exported "(no events this session)" — the class
+   * of bug that most needs a log is exactly the class whose log is gone. The
+   * export now also states what the profile looks like right now, which does
+   * not depend on anything having been recorded. */
+  it('exports the profile state even when nothing happened this session', async () => {
+    const manifestPath = join(profileDir('web'), 'package.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: [...(manifest.dsh?.profile?.bundles ?? []), 'ghost-bundle'] } }
+    writeFileSync(manifestPath, JSON.stringify(manifest))
+
+    const r = await bed.dispatch('GET', '/dsh-market/logs')
+    expect(r.status).toBe(200)
+    const text = r.text
+    expect(text).toContain('## profile state')
+    // The unresolvable row is called out, because that is the thing that
+    // stops the next boot and a plain manifest listing does not show it.
+    expect(text).toMatch(/ghost-bundle: NOT RESOLVED/)
+  })
+
+  /** #346: a catalog entry can name a monorepo subpackage its author has
+   * since moved. pnpm's failure for that is unrecognisable — the user sees a
+   * resolver error with no reason to suspect the entry rather than their own
+   * machine. Audited the live catalog: 8 of 224 subpath entries point at a
+   * directory that is gone, 3 of them with no npm package to fall back on. */
+  it('says a subpath entry is stale rather than letting pnpm look like the user fault', async () => {
+    const calls: string[] = []
+    const realFetch = globalThis.fetch
+    vi.stubGlobal('fetch', vi.fn(async (url: any, init: any) => {
+      const href = String(url)
+      if (href.includes('raw.githubusercontent.com')) {
+        calls.push(href)
+        return new Response('not found', { status: 404 })
+      }
+      return realFetch(url, init)
+    }))
+    try {
+      fake.failNextAddStderrOnce = 'ERR_PNPM_FETCH_404 some unhelpful resolver message'
+      const r = await bed.dispatch('POST', '/dsh-market/install', {
+        url: 'https://github.com/m/mono/tree/main/packages/plug-a',
+      })
+      expect(r.status).toBe(502)
+      expect(String(r.json.staleEntry)).toContain('packages/plug-a')
+      // Probed only on the failure path, and only for the subpath form.
+      expect(calls.some(href => href.includes('m/mono/HEAD/packages/plug-a/package.json'))).toBe(true)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('rejects cross-origin restore requests', async () => {
     expect((await bed.dispatch('POST', '/dsh-market/restore', { backup: {} }, { crossOrigin: true })).status).toBe(403)
   })
@@ -845,16 +930,44 @@ describe('install flow', () => {
     const ghostPath = join(profileDir('web'), 'package.json')
     const ghosted = JSON.parse(readFileSync(ghostPath, 'utf8'))
     ghosted.dependencies = { ...ghosted.dependencies, '@deepseek-ai/dsh-client-ui-theme-toggle': '^1.0.0' }
+    ghosted.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base'] } }
     writeFileSync(ghostPath, JSON.stringify(ghosted))
+    fake.profileBundleOnNextAdd = 'dsh-loop'
     fake.failAfterWriteStderrOnce = '[ERR_PNPM_FETCH_404] GET https://registry.npmjs.org/@deepseek-ai%2Fdsh-client-ui-theme-toggle: Not Found - 404'
     const r = await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
     expect(r.status).toBe(502)
     // The failed run's manifest write is rolled back — no ghost entry left
     // to break every later pnpm operation.
     expect(installedSpec('dsh-loop')).toBeUndefined()
+    expect(installedSpec('@deepseek-ai/dsh-client-ui-theme-toggle')).toBe('^1.0.0')
+    const rolledBackManifest = JSON.parse(readFileSync(ghostPath, 'utf8'))
+    expect(rolledBackManifest.dsh.profile.bundles).toEqual(['@deepseek-ai/dsh-base'])
     // The classification names the unresolvable package, decoded.
     expect(String(r.json.stderr)).toContain('@deepseek-ai/dsh-client-ui-theme-toggle')
     expect(String(r.json.stderr)).toContain('幽灵依赖')
+  })
+
+  /** #339's safety net. The rollback that leaves an orphan bundle is fixed,
+   * but the market issues one call and the HOST owns both writes, so any
+   * future write path could do the same. Checking at the end of the operation
+   * means the next restart is not the thing that discovers it. */
+  it('names a bundle the profile declares but cannot resolve, before the next boot does', async () => {
+    fake.npm['dsh-loop'] = { latest: '1.0.0', versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } } }
+    const manifestPath = join(profileDir('web'), 'package.json')
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    // A bundle row with nothing behind it: neither a dependency nor a package
+    // on disk — exactly what a half-failed add used to leave.
+    manifest.dsh = { profile: { bundles: [...(manifest.dsh?.profile?.bundles ?? []), 'ghost-bundle'] } }
+    writeFileSync(manifestPath, JSON.stringify(manifest))
+
+    const r = await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    expect((r.json.orphanBundles ?? []) as string[]).toContain('ghost-bundle')
+  })
+
+  it('says nothing about orphan bundles when every declared bundle resolves', async () => {
+    fake.npm['dsh-loop'] = { latest: '1.0.0', versions: { '1.0.0': { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] } } }
+    const r = await bed.dispatch('POST', '/dsh-market/install', { url: 'https://github.com/o/dsh-loop' })
+    expect(r.json.orphanBundles).toBeUndefined()
   })
 
   it('auto-recovers when the modules dir was built by another pnpm major (#20)', async () => {
@@ -973,6 +1086,191 @@ describe('update flow — no npm publishing required', () => {
     // disk, `/dsh-market/status` still reporting 1.11.3, an unchanged boot
     // id, and this route calling it hot-loaded in the same response.
     expect(r.json.activation['dsh-loop']).toMatchObject({ state: 'restart', hot: false })
+  })
+
+  it('rejects and rolls back when pnpm silently resolves latest to an older release', async () => {
+    advanceNpmLatest('1.2.0')
+    fake.npm['dsh-loop'].versions['0.9.0'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    fake.resolvedNpmVersionOnce = '0.9.0'
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(502)
+    expect(r.json).toMatchObject({ ok: false, failureCode: 'DOWNGRADE_DETECTED' })
+    expect(String(r.json.error)).toMatch(/拒绝降级|downgrade was rejected/)
+    expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+    const installed = JSON.parse(readFileSync(join(fake.profileDir, 'node_modules', 'dsh-loop', 'package.json'), 'utf8')) as { version?: string }
+    expect(installed.version).toBe('1.0.0')
+  })
+
+  it('accepts a release published while the install was still running', async () => {
+    advanceNpmLatest('1.2.0')
+    fake.npm['dsh-loop'].versions['1.2.1'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    // The author publishes 1.2.1 while pnpm is still downloading 1.2.0. A big
+    // plugin leaves minutes of window for that, and rolling the update back
+    // would report a good, newer build as a failure.
+    fake.resolvedNpmVersionOnce = '1.2.1'
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.json).toMatchObject({ ok: true })
+    const installed = JSON.parse(readFileSync(join(fake.profileDir, 'node_modules', 'dsh-loop', 'package.json'), 'utf8')) as { version?: string }
+    expect(installed.version).toBe('1.2.1')
+  })
+
+  it('rejects and rolls back when pnpm resolves a newer but unexpected release', async () => {
+    advanceNpmLatest('1.2.0')
+    fake.npm['dsh-loop'].versions['1.1.0'] = { manifest: { dsh: {}, main: 'lib/index.js' }, artifacts: ['lib/index.js'] }
+    fake.resolvedNpmVersionOnce = '1.1.0'
+
+    const r = await bed.dispatch('POST', '/dsh-market/update', { name: 'dsh-loop' })
+
+    expect(r.status).toBe(502)
+    expect(r.json).toMatchObject({ ok: false, failureCode: 'RESOLVED_VERSION_MISMATCH' })
+    expect(String(r.json.error)).toMatch(/目标为 v1\.2\.0|targeted v1\.2\.0/)
+    expect(installedSpec('dsh-loop')).toBe('^1.0.0')
+    const installed = JSON.parse(readFileSync(join(fake.profileDir, 'node_modules', 'dsh-loop', 'package.json'), 'utf8')) as { version?: string }
+    expect(installed.version).toBe('1.0.0')
+  })
+
+  it('exposes a versioned capability and update-check contract for plugin-owned UIs', async () => {
+    advanceNpmLatest('1.2.0')
+    const capabilities = await bed.dispatch('GET', '/dsh-market/api/v1/capabilities')
+    expect(capabilities.status).toBe(200)
+    expect(capabilities.json).toMatchObject({
+      schema: 'dsh-market/update-api/v1',
+      apiVersion: 1,
+      // The compatibility promise is machine-readable, because one that lives
+      // only in a markdown file is one no client ever reads. A release that
+      // means to make this stable has to change it here, deliberately.
+      stability: 'beta',
+      profile: 'web',
+      runtime: 'web',
+      features: { check: true, update: true, progress: true, rollback: true, restart: true },
+      restart: { supported: true, managedBy: 'market' },
+      operationRetention: 'current-process',
+      operationLimit: 50,
+    })
+
+    const check = await bed.dispatch('GET', '/dsh-market/api/v1/updates?name=dsh-loop&force=1')
+    expect(check.status).toBe(200)
+    expect(check.json).toMatchObject({
+      schema: 'dsh-market/update-api/v1',
+      package: {
+        name: 'dsh-loop',
+        source: 'npm',
+        installedVersion: '1.0.0',
+        latestVersion: '1.2.0',
+        updateAvailable: true,
+      },
+    })
+  })
+
+  it('returns an operation id immediately and exposes progress until the update settles', async () => {
+    advanceNpmLatest('1.2.0')
+    let release!: () => void
+    fake.gate = new Promise<void>((resolvePromise) => { release = resolvePromise })
+
+    const accepted = await bed.dispatch('POST', '/dsh-market/api/v1/updates', {
+      packageName: 'dsh-loop',
+    })
+    expect(accepted.status).toBe(202)
+    expect(accepted.json.operation).toMatchObject({
+      schema: 'dsh-market/update-api/v1',
+      packageName: 'dsh-loop',
+      state: 'running',
+      beforeVersion: '1.0.0',
+    })
+    const operationId = String(accepted.json.operation.operationId)
+
+    const concurrent = await bed.dispatch('POST', '/dsh-market/api/v1/updates', {
+      packageName: 'dsh-loop',
+    })
+    expect(concurrent.status).toBe(409)
+    expect(concurrent.json.failure).toMatchObject({ code: 'OPERATION_BUSY', retryable: true })
+
+    const during = await bed.dispatch('GET', `/dsh-market/api/v1/operations?operationId=${operationId}`)
+    expect(during.status).toBe(200)
+    expect(during.json.operation.state).toBe('running')
+
+    release()
+    fake.gate = null
+    let completed = during
+    for (let attempt = 0; attempt < 30 && completed.json.operation.state === 'running'; attempt += 1) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 5))
+      completed = await bed.dispatch('GET', `/dsh-market/api/v1/operations?operationId=${operationId}`)
+    }
+    expect(completed.json.operation).toMatchObject({
+      state: 'succeeded',
+      beforeVersion: '1.0.0',
+      installedVersion: '1.2.0',
+      outcome: { restartRequired: true },
+      failure: null,
+    })
+  })
+
+  it('normalizes an agent guard refusal as a terminal operation failure', async () => {
+    advanceNpmLatest('1.2.0')
+    const guarded = createTestbed({}, undefined, {
+      list: () => [{ id: 'main', status: 'running' }],
+    })
+    const accepted = await guarded.dispatch('POST', '/dsh-market/api/v1/updates', {
+      packageName: 'dsh-loop',
+    })
+    expect(accepted.status).toBe(202)
+    const operationId = String(accepted.json.operation.operationId)
+    let completed = await guarded.dispatch('GET', `/dsh-market/api/v1/operations?operationId=${operationId}`)
+    for (let attempt = 0; attempt < 30 && completed.json.operation.state === 'running'; attempt += 1) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 5))
+      completed = await guarded.dispatch('GET', `/dsh-market/api/v1/operations?operationId=${operationId}`)
+    }
+    expect(completed.json.operation).toMatchObject({
+      state: 'failed',
+      installedVersion: '1.0.0',
+      failure: { code: 'AGENTS_RUNNING', retryable: true },
+    })
+    guarded.dispose()
+  })
+
+  it('keeps compatibility rollback private while exposing operation-scoped rollback', async () => {
+    const hostPeerDir = join(fake.profileDir, 'node_modules', '@deepseek-ai', 'dsh-settings')
+    mkdirSync(hostPeerDir, { recursive: true })
+    writeFileSync(join(hostPeerDir, 'package.json'), JSON.stringify({
+      name: '@deepseek-ai/dsh-settings',
+      version: '0.1.0-rc.6',
+    }))
+    fake.npm['dsh-loop'].latest = '1.2.0'
+    fake.npm['dsh-loop'].versions['1.2.0'] = {
+      manifest: {
+        dsh: {},
+        main: 'lib/index.js',
+        peerDependencies: { '@deepseek-ai/dsh-settings': '^0.1.0-rc.7' },
+      },
+      artifacts: ['lib/index.js'],
+    }
+    vi.stubGlobal('fetch', () => Promise.resolve(new Response(JSON.stringify({ version: '1.2.0' }), { status: 200 })))
+
+    const accepted = await bed.dispatch('POST', '/dsh-market/api/v1/updates', { packageName: 'dsh-loop' })
+    const operationId = String(accepted.json.operation.operationId)
+    let completed = await bed.dispatch('GET', `/dsh-market/api/v1/operations?operationId=${operationId}`)
+    for (let attempt = 0; attempt < 30 && completed.json.operation.state === 'running'; attempt += 1) {
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 5))
+      completed = await bed.dispatch('GET', `/dsh-market/api/v1/operations?operationId=${operationId}`)
+    }
+    expect(completed.json.operation).toMatchObject({
+      state: 'succeeded',
+      installedVersion: '1.2.0',
+      outcome: { rollback: { available: true, state: 'available' } },
+    })
+    expect(JSON.stringify(completed.json)).not.toContain('rollbackId')
+
+    const rolledBack = await bed.dispatch('POST', '/dsh-market/api/v1/rollback', { operationId })
+    expect(rolledBack.status).toBe(200)
+    expect(rolledBack.json.operation).toMatchObject({
+      state: 'rolled-back',
+      outcome: { restartRequired: true, rollback: { available: false, state: 'succeeded' } },
+    })
+    expect(installedSpec('dsh-loop')).toBe('^1.0.0')
   })
 
   it('updates a mirror-installed plugin from GitHub, not from a same-named npm package', async () => {
@@ -2051,6 +2349,16 @@ describe('externally removed hot mounts (#29)', () => {
 })
 
 describe('one-click restart guards (#14)', () => {
+  it('delegates the public v1 restart route to the guarded restart executor', async () => {
+    const result = await bed.dispatch('POST', '/dsh-market/api/v1/restart', {})
+    expect(result.status).toBe(202)
+    expect(result.json).toMatchObject({
+      schema: 'dsh-market/update-api/v1',
+      result: { ok: true },
+    })
+    expect(restartCalls.count).toBe(1)
+  })
+
   it('schedules exactly once for a trusted loopback request; repeat is 409', async () => {
     const r = await bed.dispatch('POST', '/dsh-market/restart', {})
     expect(r.status).toBe(202)

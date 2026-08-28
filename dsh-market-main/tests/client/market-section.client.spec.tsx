@@ -98,6 +98,33 @@ afterEach(() => {
   sessionStorage.clear()
 })
 
+describe('api() base resolution (#345)', () => {
+  /** Behind a reverse proxy that mounts dsh under a prefix, a root-absolute
+   * `/dsh-market/...` resolves against the ORIGIN and misses the prefix rule,
+   * so the panel rendered and every request in it 404'd. Anchoring on the
+   * document directory fixes that WITHOUT changing anything at the root,
+   * which is where nearly everyone runs. */
+  const base = () => document.querySelector('base')
+
+  afterEach(() => { base()?.remove() })
+
+  it('is unchanged at the root, which must not regress', async () => {
+    const { api } = await import('../../src/client/market-data.ts')
+    expect(api('/dsh-market/installed')).toBe('/dsh-market/installed')
+  })
+
+  it('follows the prefix the page is served under', async () => {
+    const { api } = await import('../../src/client/market-data.ts')
+    const tag = document.createElement('base')
+    tag.setAttribute('href', 'http://host.example/app/my-dsh/')
+    document.head.appendChild(tag)
+    expect(api('/dsh-market/installed')).toBe('/app/my-dsh/dsh-market/installed')
+    // Arbitrary depth, and a leading slash in the argument is not special.
+    tag.setAttribute('href', 'http://host.example/user/a/b/')
+    expect(api('dsh-market/status')).toBe('/user/a/b/dsh-market/status')
+  })
+})
+
 describe('MarketSection (jsdom)', () => {
   it('renders the catalog with install buttons once the registry loads', async () => {
     render(<MarketSection {...props()} />)
@@ -155,6 +182,45 @@ describe('MarketSection (jsdom)', () => {
     expect(screen.getByRole('button', { name: en.tabAdvanced }).className).toMatch(/\bon\b|_on_/)
     expect(screen.getByRole('button', { name: en.tabDiagnostics }).className).toMatch(/\bon\b|_on_/)
     expect(screen.getByRole('button', { name: en.tabBackup }).className).not.toMatch(/\bon\b|_on_/)
+  })
+
+  it('scrolls the shared body back to the top when switching tabs', async () => {
+    const { container } = render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    const scroller = container.querySelector('[data-dsh-market-root] > [class*="body"]') as HTMLElement
+    expect(scroller).toBeTruthy()
+
+    scroller.scrollTop = 800
+    fireEvent.scroll(scroller)
+    expect(screen.getByRole('button', { name: en.backTop })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    expect(scroller.scrollTop).toBe(0)
+    expect(screen.queryByRole('button', { name: en.backTop })).toBeNull()
+
+    scroller.scrollTop = 800
+    fireEvent.click(screen.getByRole('button', { name: en.tabDiscover }))
+    expect(scroller.scrollTop).toBe(0)
+
+    scroller.scrollTop = 800
+    fireEvent.click(screen.getByRole('button', { name: en.tabAdvanced }))
+    expect(scroller.scrollTop).toBe(0)
+  })
+
+  it('scrolls the shared body back to the top when switching Discover categories', async () => {
+    const { container } = render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    const scroller = container.querySelector('[data-dsh-market-root] > [class*="body"]') as HTMLElement
+    expect(scroller).toBeTruthy()
+
+    scroller.scrollTop = 800
+    fireEvent.scroll(scroller)
+    expect(screen.getByRole('button', { name: en.backTop })).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tools' }))
+    expect(scroller.scrollTop).toBe(0)
+    expect(screen.queryByRole('button', { name: en.backTop })).toBeNull()
+    await waitFor(() => expect(screen.queryByText('whale-skin')).toBeNull())
   })
 
   it('marks only the repository-matched card for a same-named local link (#141)', async () => {
@@ -597,12 +663,58 @@ describe('stuck pending recovery (#32)', () => {
       sessionStorage.setItem('dshm-pending', JSON.stringify({ url: 'https://github.com/alice/dsh-loop' }))
       render(<MarketSection {...props()} />)
       await vi.waitFor(() => { screen.getByText('dsh-loop') })
+      await vi.waitFor(() => { screen.getByRole('button', { name: `${en.opInstalling} 1/1` }) })
+      fireEvent.click(screen.getByRole('button', { name: `${en.opInstalling} 1/1` }))
+      const panel = document.querySelector('[class*="opPanel"]')
+      expect(panel?.textContent).toContain('dsh-loop')
       // Host stays idle and the plugin never appears in installed: two polls
       // (2s apart) must conclude the install died and release the button.
       await vi.advanceTimersByTimeAsync(2100)
       await vi.advanceTimersByTimeAsync(2100)
       expect(sessionStorage.getItem('dshm-pending')).toBeNull()
       expect(screen.getByText(new RegExp(en.installFail))).toBeTruthy()
+      expect(panel?.textContent).not.toContain('dsh-loop')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('lost install progress (config page reopened)', () => {
+  it('keeps the recovered install task aligned with the host lifecycle', async () => {
+    vi.useFakeTimers()
+    try {
+      // Keep the original URL-only marker shape so updates from an older
+      // client recover too; the catalog supplies the task's display name.
+      sessionStorage.setItem('dshm-pending', JSON.stringify({ url: 'https://github.com/alice/dsh-loop' }))
+      let settled = false
+      vi.stubGlobal('fetch', vi.fn((url: string) => {
+        const path = String(url).split('?')[0]
+        const payload =
+          path === '/dsh-market/registry' ? { source: 'live', registry: REGISTRY }
+          : path === '/dsh-market/installed' ? { profile: 'web', installed: {}, live: [], disabled: [], groups: {}, groupOrder: [] }
+          : path === '/dsh-market/status' ? {
+              active: !settled, busy: !settled, pnpm: true, boot: 'boot-1', restart: true,
+              installed: settled ? { 'dsh-loop': '^1.0.0' } : {},
+            }
+          : path === '/dsh-market/updates' ? { updates: {} }
+          : null
+        if (payload === null) return Promise.reject(new Error(`unstubbed fetch: ${String(url)}`))
+        return Promise.resolve(new Response(JSON.stringify(payload), { status: 200 }))
+      }))
+      render(<MarketSection {...props()} />)
+      await vi.waitFor(() => { screen.getByRole('button', { name: en.installing }) })
+      fireEvent.click(screen.getByRole('button', { name: `${en.opInstalling} 1/1` }))
+      const panel = document.querySelector('[class*="opPanel"]')
+      expect(panel, 'the Tasks panel did not open').toBeTruthy()
+      expect(panel!.textContent).toContain('dsh-loop')
+
+      settled = true
+      await vi.advanceTimersByTimeAsync(2100)
+      await vi.waitFor(() => {
+        expect(sessionStorage.getItem('dshm-pending')).toBeNull()
+        expect(panel!.textContent).not.toContain('dsh-loop')
+      })
     } finally {
       vi.useRealTimers()
     }
@@ -610,7 +722,7 @@ describe('stuck pending recovery (#32)', () => {
 })
 
 describe('lost update progress (config page reopened)', () => {
-  it('restores the running update row from the marker and converges it once the host settles', async () => {
+  it('keeps the recovered update task aligned with the host lifecycle', async () => {
     vi.useFakeTimers()
     try {
       // A previous page load started an update, then the config page closed
@@ -637,6 +749,10 @@ describe('lost update progress (config page reopened)', () => {
       fireEvent.click(screen.getByRole('button', { name: new RegExp(re(en.tabInstalled)) }))
       // The restored marker re-renders the running row and its live progress.
       await vi.waitFor(() => { screen.getByRole('button', { name: en.updating }) })
+      fireEvent.click(screen.getByRole('button', { name: re(en.opInstalling) }))
+      const panel = document.querySelector('[class*="opPanel"]')
+      expect(panel, 'the Tasks panel did not open').toBeTruthy()
+      expect(panel!.textContent).toContain('dsh-loop')
       await vi.advanceTimersByTimeAsync(2100)
       await vi.waitFor(() => { screen.getByText(/Downloading · is-odd@3\.0\.1 · 3 packages processed/) })
       // The host finishes the update; two idle polls hand the row back.
@@ -646,6 +762,7 @@ describe('lost update progress (config page reopened)', () => {
       await vi.waitFor(() => {
         expect(sessionStorage.getItem('dshm-updating')).toBeNull()
         expect(screen.queryByRole('button', { name: en.updating })).toBeNull()
+        expect(panel!.textContent).not.toContain('dsh-loop')
       })
     } finally {
       vi.useRealTimers()
@@ -997,6 +1114,152 @@ describe('#60 enable/disable switches in the Installed tab', () => {
       expect(banners.length).toBe(1)
       expect(banners[0]!.textContent).toContain('2')
     })
+  })
+})
+
+/** #340: the banner counts what the page has not caught up with, and both
+ * of its sets were append-only — nothing anywhere removed a name. Install
+ * then uninstall and the page is level again, with nothing left for a
+ * refresh to show, yet it kept asking. It was reporting session history,
+ * not pending work. */
+describe('refresh banner falls back when the change is undone (#340)', () => {
+  it('stops asking after the installed plugin is uninstalled again', async () => {
+    let present: Record<string, string> = {}
+    stubFetch({
+      '/dsh-market/installed': () => ({
+        profile: 'web', installed: present, live: Object.keys(present), disabled: [],
+        activation: { 'dsh-loop': { state: 'live', reasons: [], bundle: true, hot: true } },
+      }),
+      '/dsh-market/install': () => {
+        present = { 'dsh-loop': '^1.0.0' }
+        return { ok: true, hot: true, installed: present }
+      },
+      '/dsh-market/uninstall': () => { present = {}; return { ok: true, hot: true } },
+    })
+    render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+    // The card for THIS plugin, not whichever Install button sorts first —
+    // installing one plugin and uninstalling another would prove nothing.
+    let card: HTMLElement | null = screen.getByText('dsh-loop')
+    while (card !== null && within(card).queryAllByRole('button', { name: en.install }).length === 0) {
+      card = card.parentElement
+    }
+    fireEvent.click(within(card!).getAllByRole('button', { name: en.install })[0]!)
+    fireEvent.click(await screen.findByRole('button', { name: en.confirmInstall }))
+    await waitFor(() => expect(screen.getAllByText(re(en.refreshBanner)).length).toBe(1))
+
+    fireEvent.click(screen.getByRole('button', { name: /Installed/ }))
+    fireEvent.click((await screen.findAllByRole('button', { name: en.uninstall }))[0]!)
+    await screen.findByText(re(en.uninstallConfirmDesc))
+    // The modal's confirm carries the same label as the row's trigger, so it
+    // is the LAST one on screen once the dialog is open.
+    fireEvent.click(screen.getAllByRole('button', { name: en.uninstall }).at(-1)!)
+
+    await waitFor(() => expect(screen.queryAllByText(re(en.refreshBanner))).toHaveLength(0))
+  })
+
+  it('stops asking when a switch is put back where the page found it', async () => {
+    let disabled: string[] = []
+    stubFetch({
+      '/dsh-market/installed': () => ({
+        profile: 'web', installed: { 'dsh-loop': '^1.0.0' }, live: ['dsh-loop'], disabled,
+        activation: { 'dsh-loop': { state: 'live', reasons: [], bundle: true, hot: true } },
+      }),
+      '/dsh-market/toggle': (body: any) => {
+        disabled = body.enabled ? [] : ['dsh-loop']
+        return { ok: true, disabled, live: body.enabled ? ['dsh-loop'] : [], refresh: true }
+      },
+    })
+    render(<MarketSection {...props()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Installed/ }))
+
+    fireEvent.click(await screen.findByRole('switch', { name: en.disable + ' dsh-loop' }))
+    await waitFor(() => expect(screen.getAllByText(re(en.refreshBanner)).length).toBe(1))
+
+    // Back to the position the page was rendered with: nothing to show.
+    fireEvent.click(await screen.findByRole('switch', { name: en.enable + ' dsh-loop' }))
+    await waitFor(() => expect(screen.queryAllByText(re(en.refreshBanner))).toHaveLength(0))
+  })
+})
+
+/** #342 / #343: a scoped package name is what tells two installed plugins
+ * apart, and the ellipsis removed exactly the end that distinguishes them —
+ * `@deepseek-ai/dsh-client-ui-…` next to `@dsh-external/dsh-sessi…` are both
+ * just prefixes. */
+describe('long installed names stay readable (#342, #343)', () => {
+  const LONG = '@deepseek-ai/dsh-client-ui-settings-plugins-extended'
+
+  it('does not truncate, and names itself on hover either way', async () => {
+    stubFetch({
+      '/dsh-market/installed': {
+        profile: 'web', installed: { [LONG]: '^1.0.0' }, live: [LONG], disabled: [],
+      },
+    })
+    const { container } = render(<MarketSection {...props()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Installed/ }))
+    await screen.findByText(LONG)
+
+    const cell = container.querySelector('[class*="irowNameText"]')!
+    expect(cell.textContent).toBe(LONG)
+    const link = cell.querySelector('a')
+    if (link !== null) expect(link.getAttribute('title')).toBe(LONG)
+  })
+})
+
+/** #347: a catalog description answers "what is this", written by its author
+ * for strangers and often not in the reader's language. It cannot answer "why
+ * did I install this", which is what someone with forty plugins is asking. */
+describe('plugin notes (#347)', () => {
+  const installedStub = (notes: Record<string, string> = {}) => stubFetch({
+    '/dsh-market/installed': () => ({
+      profile: 'web', installed: { 'dsh-loop': '^1.0.0' }, live: ['dsh-loop'], disabled: [], notes,
+    }),
+    '/dsh-market/note': (body: any) => ({
+      ok: true,
+      // Mirrors the route: trimmed, and empty clears rather than storing blank.
+      notes: String(body.text).trim() === '' ? {} : { [body.name]: String(body.text).trim() },
+    }),
+  })
+
+  it('shows the author description until a note replaces it', async () => {
+    installedStub()
+    render(<MarketSection {...props()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Installed/ }))
+    expect(await screen.findByText('Loop task runner')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: en.noteAdd }))
+    fireEvent.change(screen.getByPlaceholderText(en.notePlaceholder), { target: { value: 'for project A' } })
+    fireEvent.click(screen.getByRole('button', { name: en.noteSave }))
+
+    // The note takes the description's place rather than sitting beside it.
+    expect(await screen.findByText('for project A')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByText('Loop task runner')).toBeNull())
+  })
+
+  it('keeps the original one click away, and puts it back', async () => {
+    installedStub({ 'dsh-loop': 'for project A' })
+    render(<MarketSection {...props()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Installed/ }))
+    await screen.findByText('for project A')
+
+    fireEvent.click(screen.getByRole('button', { name: en.noteSeeTheirs }))
+    expect(await screen.findByText('Loop task runner')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: en.noteSeeMine }))
+    expect(await screen.findByText('for project A')).toBeTruthy()
+  })
+
+  it('clearing a note restores the author description', async () => {
+    installedStub({ 'dsh-loop': 'for project A' })
+    render(<MarketSection {...props()} />)
+    fireEvent.click(await screen.findByRole('button', { name: /Installed/ }))
+    await screen.findByText('for project A')
+
+    fireEvent.click(screen.getByRole('button', { name: en.noteEdit }))
+    fireEvent.change(screen.getByPlaceholderText(en.notePlaceholder), { target: { value: '   ' } })
+    fireEvent.click(screen.getByRole('button', { name: en.noteSave }))
+
+    expect(await screen.findByText('Loop task runner')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: en.noteSeeTheirs })).toBeNull()
   })
 })
 
@@ -2482,6 +2745,30 @@ describe('card thumbnail + lightbox (curated screenshots only)', () => {
     expect(document.body.lastElementChild).toBe(own)
   })
 
+  it('keeps one container, last in body, across repeated opens', async () => {
+    // The container is created during render (createPortal needs a target) but
+    // MOVED into body from a layout effect — see useMarketPortalHost. What is
+    // observable from here is the invariant that move exists to hold: exactly
+    // one container, always body's last child, however many times the preview
+    // is opened. A second container, or one that drifts off the end, is the
+    // shared-child-list churn between two React roots that #293 was about.
+    resetMarketPortalHost()
+    stubFetch({ '/dsh-market/registry': { source: 'live', registry: registryWithShots() } })
+    const { container } = render(<MarketSection {...props()} />)
+    await screen.findByText('dsh-loop')
+
+    for (let i = 0; i < 3; i++) {
+      fireEvent.click(container.querySelector('img[class*="cardShot"]')!)
+      await waitFor(() => expect(document.querySelector('[class*="lightboxImg"]')).toBeTruthy())
+      expect(document.querySelectorAll('[data-dsh-market-portal]').length,
+        'a second portal container was created').toBe(1)
+      expect(document.body.lastElementChild,
+        'the container drifted off the end of body').toBe(document.querySelector('[data-dsh-market-portal]'))
+      fireEvent.click(document.querySelector('[class*="lightboxClose"]')!)
+      await waitFor(() => expect(document.querySelector('[class*="lightboxImg"]')).toBeNull())
+    }
+  })
+
   it('opens a lightbox on click, at the clicked shot, and wraps prev/next around the ends', async () => {
     stubFetch({ '/dsh-market/registry': { source: 'live', registry: registryWithShots() } })
     const { container } = render(<MarketSection {...props()} />)
@@ -2502,6 +2789,26 @@ describe('card thumbnail + lightbox (curated screenshots only)', () => {
     // Prev from the first wraps to the last, the same way.
     fireEvent.click(document.querySelector('[class*="lightboxPrev"]')!)
     expect(img().src).toBe(SHOT_B)
+  })
+
+  it('does not auto-advance the lightbox — a full-bleed preview stays put until the viewer moves on', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      stubFetch({ '/dsh-market/registry': { source: 'live', registry: registryWithShots() } })
+      const { container } = render(<MarketSection {...props()} />)
+      await vi.waitFor(() => expect(screen.queryByText('dsh-loop')).toBeTruthy())
+
+      fireEvent.click(container.querySelector('img[class*="cardShot"]')!)
+      await vi.waitFor(() => expect(document.querySelector('[class*="lightboxImg"]')).toBeTruthy())
+      const img = () => document.querySelector('[class*="lightboxImg"]') as HTMLImageElement
+      expect(img().src).toBe(SHOT_A)
+      await vi.advanceTimersByTimeAsync(10_000)
+      // The preview is on demand: nothing may page past the shot the viewer
+      // is reading. Manual navigation (arrows/dots/keys) is what moves it.
+      expect(img().src).toBe(SHOT_A)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('closes only the lightbox on Escape, leaving the dialog underneath open', async () => {

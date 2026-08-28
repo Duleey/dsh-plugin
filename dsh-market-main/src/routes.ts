@@ -10,20 +10,22 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { forgetCatalog, loadRegistry, pluginCategories } from './registry.ts'
 import {
-  cleanHotDir, hotMount, hotUnmount, listHotMounts,
+  cleanHotDir, hotMount, hotUnmount, listHotMounts, MAX_NOTE,
   mountClientOnlyDeps, purgeMarketState, readMarketState, writeMarketState,
 } from './hot.ts'
 import { createGroup, deleteGroup, removeFromGroups, renameGroup, setGroupMembers } from './groups.ts'
-import { exportLogs, logEvent } from './log.ts'
+import { configurePersistentLog, exportLogs, logEvent, readPersistentLog } from './log.ts'
+import { marketFetch } from './net.ts'
 import { diagnosePackageManifests } from './diagnostics.ts'
 import {
   BOOT_ID, cancelActive, probePnpm, progress, provisionPnpm, runDshPlugin,
   type PluginCommandRuntime,
 } from './dsh-cli.ts'
-import { addProfileBundle, dropFromManifest, hasLoadableEntry, INBOX_BUNDLES, isDshProfileName, profileDir, readInstalled, readInstalledManifest, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readManifestDeps, readProfileBundles, removeProfileBundle, restoreManifestDeps, setAllowBuilds } from './profile.ts'
+import { addProfileBundle, dropFromManifest, hasLoadableEntry, INBOX_BUNDLES, isDshProfileName, profileDir, readInstalled, readInstalledManifest, readInstalledRepoEvidence, readInstalledVersion, readLockCommits, readProfileBundles, readProfileManifestSnapshot, removeProfileBundle, restoreProfileManifest, setAllowBuilds, type ProfileManifestSnapshot } from './profile.ts'
 import { assessProfile, classifyPeer, introducedDuplicateNames, introducedRisks, type CompatibilityRisk } from './compatibility.ts'
 import { runningAgentIds, type AgentsLookup } from './agents.ts'
 import { analyzeProfile, type DuplicateName } from './check.ts'
@@ -37,7 +39,8 @@ import { asChannel, CHANNELS, DIST_TAG, resolveChannel, type Channel } from './c
 import { asRegion, REGIONS, routesFor, setActiveRegion, type Region } from './regions.ts'
 import { resolveRegion } from './region-probe.ts'
 import { acceleratedTarget, resolveHeadCommit } from './accelerate.ts'
-import { checkUpdates, fetchNpmLatest, invalidateUpdates, isUpgrade, latestPublishedRecently, setUpdateRegistry, versionOnChannel } from './updates.ts'
+import { updateNotesFor } from './changelog.ts'
+import { checkUpdates, compareVersions, fetchNpmLatest, invalidateUpdates, isUpgrade, latestPublishedRecently, setUpdateRegistry, versionOnChannel } from './updates.ts'
 import { createThemeManager, type LoaderEntry } from './themes.ts'
 import { readJsonBody, sameOrigin, sendJson } from './http.ts'
 import { detectedSupervisor, restartAllowed, scheduleRestart, servingPort, trustedRestartRequest, trustedDownloadRequest } from './restart.ts'
@@ -53,6 +56,7 @@ import {
 import {
   createGist, fitsGistLimit, GistError, gistErrorCode, parseGistId, readGist, resolveGistTokenSource, updateGist, verifyGistToken,
 } from './gist.ts'
+import { MAX_UPDATE_OPERATIONS_V1, UpdateOperationStoreV1, UPDATE_API_V1_SCHEMA } from './update-api-v1.ts'
 
 export type { LoaderEntry } from './themes.ts'
 export type { UpdateStatus } from './updates.ts'
@@ -193,6 +197,8 @@ export function mountMarketRoutes(
     throw new Error(message)
   }
   const activeProfileDir = profileDir(config.profile, config.profileDirectory)
+  const persistentLogFile = join(activeProfileDir, '.dsh-market', 'log.ndjson')
+  configurePersistentLog(persistentLogFile)
   let agentGuardUnavailableLogged = false
   /** Running-agent ids for the mutation gate; logs once when the host exposes no agents service. */
   const runningAgentsForGuard = (): string[] => {
@@ -462,8 +468,8 @@ export function mountMarketRoutes(
    * next start still fails. Re-run pnpm install against the restored
    * manifest to rematerialize the previous build's files.
    */
-  async function rollbackUpdateBuild(name: string, manifestBefore: Record<string, string>): Promise<{ ok: boolean; detail: string | null }> {
-    const rolledBack = restoreManifestDeps(config.profile, manifestBefore, activeProfileDir)
+  async function rollbackUpdateBuild(name: string, manifestBefore: ProfileManifestSnapshot): Promise<{ ok: boolean; detail: string | null }> {
+    const rolledBack = restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
     if (rolledBack.length === 0) return { ok: true, detail: null }
     // CI=true (the market always runs pnpm that way) turns frozen-lockfile
     // on, and the restored manifest pin now disagrees with the lockfile the
@@ -483,7 +489,7 @@ export function mountMarketRoutes(
     id: string
     kind: 'update' | 'install'
     names: string[]
-    manifestBefore?: Record<string, string>
+    manifestBefore?: ProfileManifestSnapshot
     /** github: updates must re-add the pre-update commit, not just reinstall. */
     gitTarget?: string
     beforeCommit?: string | null
@@ -501,14 +507,14 @@ export function mountMarketRoutes(
   /** Restore a github: update by re-adding the commit captured before the update. */
   async function rollbackGitBuild(
     name: string,
-    manifestBefore: Record<string, string>,
+    manifestBefore: ProfileManifestSnapshot,
     target: string,
     beforeCommit: string | null,
   ): Promise<{ ok: boolean; detail: string | null }> {
     if (beforeCommit === null) {
       return { ok: false, detail: 'the previous commit is unknown; nothing to roll back to' }
     }
-    restoreManifestDeps(config.profile, manifestBefore, activeProfileDir)
+    restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
     const add = await runPlugin(config.profile, ['add', RELEASE_AGE_OVERRIDE, `${target}#${beforeCommit}`])
     if (add.exitCode !== 0 || add.timedOut || add.cancelled) {
       return { ok: false, detail: failureDetail(add) }
@@ -516,7 +522,7 @@ export function mountMarketRoutes(
     // pnpm wrote a commit-pinned spec; the profile's durable spec must stay
     // the original `github:owner/repo` form. The lockfile keeps the restored
     // commit resolution for the next boot.
-    restoreManifestDeps(config.profile, manifestBefore, activeProfileDir)
+    restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
     logEvent('info', 'update-rollback', `${name}: restored github build at ${beforeCommit}`)
     return { ok: true, detail: null }
   }
@@ -560,6 +566,65 @@ export function mountMarketRoutes(
       logEvent('warn', 'restore', `post-restore analysis failed: ${error instanceof Error ? error.message : String(error)}`)
       return []
     }
+  }
+
+  /**
+   * Bundles the profile declares that will not resolve at boot.
+   *
+   * The boot loader reads `dsh.profile.bundles` and dies on the first name it
+   * cannot resolve — the whole profile, not just that plugin (#339). The
+   * rollback that leaves such a row behind is fixed, but the market issues
+   * one call and the host owns both writes, so this is the net under any
+   * write path that does the same thing next: check at the end of an
+   * operation instead of letting the next restart be the one to find out.
+   *
+   * Judged by the SAME analysis the diagnostics page uses, deliberately. A
+   * bundle can legitimately live in the dsh installation rather than the
+   * profile's node_modules (#316), and reimplementing that resolution here
+   * would call those orphans.
+   */
+  function orphanBundles(): string[] {
+    try {
+      return analyzeProfile(activeProfileDir).bundles
+        // Not an in-box bundle we merely could not locate (#369): those are
+        // supplied by the dsh installation, and failing to find one is a gap
+        // in what this process can see rather than a profile that will not
+        // start. Reporting them here rolled back a good update.
+        .filter(layer => layer.directory === null && layer.unresolvedInbox !== true)
+        .map(layer => layer.name)
+    } catch (error) {
+      logEvent('warn', 'install', `bundle resolution check failed: ${error instanceof Error ? error.message : String(error)}`)
+      return []
+    }
+  }
+
+  /**
+   * Whether a `#path:` target still points at a directory that exists.
+   *
+   * A catalog entry can name a monorepo subpackage that the author has since
+   * moved or renamed. pnpm's failure for that is unrecognisable — the user
+   * sees a resolver error and no reason to suspect the entry rather than
+   * their own machine (#346). Audited the live catalog while looking into
+   * it: 8 of the 224 subpath entries point at a directory that is gone.
+   *
+   * Only ever called AFTER an install has already failed, so the happy path
+   * pays nothing, and a network problem here just means no extra sentence.
+   */
+  async function staleSubpath(target: string): Promise<string | null> {
+    const match = /^github:([^#]+)#path:\/(.+)$/.exec(target)
+    if (match === null) return null
+    const [, repo, subpath] = match
+    try {
+      const res = await marketFetch(
+        `https://raw.githubusercontent.com/${repo!}/HEAD/${subpath!}/package.json`,
+        { signal: AbortSignal.timeout(6000) },
+      )
+      if (res.ok) return null
+      if (res.status !== 404) return null
+    } catch {
+      return null
+    }
+    return `目录条目指向的子目录在仓库里已不存在（${repo!} 的 ${subpath!}），多半是作者改名或移动了它——这不是你的环境的问题。请到 awesome-dsh-plugin 反馈这条收录已失效。 / This catalog entry points at a subdirectory that no longer exists in the repository (${subpath!} in ${repo!}); the author most likely renamed or moved it. Nothing is wrong with your setup — please report the stale entry to awesome-dsh-plugin.`
   }
 
   async function restoreBackup(value: unknown): Promise<{ files: number; errors: { name: string; error: string }[]; unportable?: Array<{ name: string; spec: string }>; bootErrors?: string[] }> {
@@ -662,7 +727,285 @@ export function mountMarketRoutes(
   }
   }
 
+  type RouteHandler = (request: IncomingMessage, response: ServerResponse) => void | Promise<void>
+  type RouteDefinition = { kind: 'exact' | 'prefix'; path: string; handler: RouteHandler }
+  const legacyHandlers = new Map<string, RouteHandler>()
+  const captureLegacy = (path: string, route: RouteDefinition): RouteDefinition => {
+    legacyHandlers.set(path, route.handler)
+    return route
+  }
+  const operationsV1 = new UpdateOperationStoreV1(BOOT_ID)
+
+  /** Invoke one existing route in memory so v1 reuses the battle-tested executor. */
+  async function invokeLegacy(
+    path: string,
+    source: IncomingMessage,
+    method: 'GET' | 'POST',
+    body?: unknown,
+    url = path,
+  ): Promise<{ status: number; payload: unknown }> {
+    const handler = legacyHandlers.get(path)
+    if (handler === undefined) throw new Error(`legacy route is unavailable: ${path}`)
+    const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
+    const replay = Readable.from(chunks) as unknown as IncomingMessage
+    Object.assign(replay, {
+      method,
+      url,
+      headers: { ...source.headers },
+      socket: source.socket,
+    })
+    let status = 200
+    let text = ''
+    const captured = {
+      writeHead(code: number) { status = code; return this },
+      end(chunk?: string | Buffer) {
+        if (chunk !== undefined) text += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk
+        return this
+      },
+    } as unknown as ServerResponse
+    await handler(replay, captured)
+    let payload: unknown = null
+    try { payload = text === '' ? null : JSON.parse(text) as unknown } catch { payload = { error: text } }
+    return { status, payload }
+  }
+
+  const packageNameFrom = (request: IncomingMessage): string => {
+    try { return new URL(request.url ?? '', 'http://localhost').searchParams.get('name') ?? '' } catch { return '' }
+  }
+
+  const operationIdFrom = (request: IncomingMessage): string => {
+    try { return new URL(request.url ?? '', 'http://localhost').searchParams.get('operationId') ?? '' } catch { return '' }
+  }
+
+  const forceCheckFrom = (request: IncomingMessage): boolean => {
+    try { return new URL(request.url ?? '', 'http://localhost').searchParams.get('force') === '1' } catch { return false }
+  }
+
   const disposers = [
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/api/v1/capabilities',
+      handler: (request, response) => {
+        if (request.method !== 'GET') {
+          response.writeHead(405, { allow: 'GET' })
+          response.end()
+          return
+        }
+        const canRestart = restartAllowed(config)
+        sendJson(response, 200, {
+          schema: UPDATE_API_V1_SCHEMA,
+          apiVersion: 1,
+          // Machine-readable, because a policy that lives only in a markdown
+          // file is one a client never reads. `beta` says the shape may still
+          // change; it becomes `stable` once a release stops moving it, and
+          // that is the point at which the compatibility promise starts.
+          stability: 'beta',
+          marketVersion: marketVersion(),
+          profile: config.profile,
+          bootId: BOOT_ID,
+          runtime: config.profileDirectory === undefined ? 'web' : 'desktop',
+          features: {
+            check: true,
+            update: true,
+            progress: true,
+            rollback: true,
+            restart: canRestart,
+          },
+          restart: {
+            supported: canRestart,
+            managedBy: canRestart ? 'market' : config.profileDirectory === undefined ? 'operator' : 'desktop-host',
+            supervisor: detectedSupervisor(),
+          },
+          operationRetention: 'current-process',
+          operationLimit: MAX_UPDATE_OPERATIONS_V1,
+          endpoints: {
+            updates: '/dsh-market/api/v1/updates',
+            operations: '/dsh-market/api/v1/operations',
+            rollback: '/dsh-market/api/v1/rollback',
+            restart: '/dsh-market/api/v1/restart',
+          },
+        })
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/api/v1/updates',
+      handler: async (request, response) => {
+        if (request.method === 'GET') {
+          const name = packageNameFrom(request)
+          if (!NPM_NAME_RE.test(name)) {
+            sendJson(response, 400, { schema: UPDATE_API_V1_SCHEMA, error: 'a valid package name is required' })
+            return
+          }
+          try {
+            const force = forceCheckFrom(request)
+            const channel = activeChannel()
+            const channelFor = SELF_NAMES.has(name) ? new Map([[name, channel]]) : undefined
+            const update = (await checkUpdates(config.profile, force, activeProfileDir, channelFor))[name]
+            if (update === undefined) {
+              sendJson(response, 404, { schema: UPDATE_API_V1_SCHEMA, error: 'plugin is not installed' })
+              return
+            }
+            sendJson(response, 200, {
+              schema: UPDATE_API_V1_SCHEMA,
+              package: {
+                name,
+                source: update.kind,
+                installedVersion: update.current ?? update.version,
+                latestVersion: update.latest,
+                updateAvailable: update.updateAvailable,
+                channelSwitch: update.channelSwitch ?? null,
+              },
+            })
+          } catch (error) {
+            sendJson(response, 500, {
+              schema: UPDATE_API_V1_SCHEMA,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          }
+          return
+        }
+
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'GET, POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { schema: UPDATE_API_V1_SCHEMA, error: 'untrusted origin' })
+          return
+        }
+        try {
+          const body = (await readJsonBody(request)) as { packageName?: unknown; force?: unknown }
+          const packageName = typeof body.packageName === 'string' ? body.packageName : ''
+          if (!NPM_NAME_RE.test(packageName)) {
+            sendJson(response, 400, { schema: UPDATE_API_V1_SCHEMA, error: 'a valid package name is required' })
+            return
+          }
+          if (operationsV1.hasActive()) {
+            sendJson(response, 409, {
+              schema: UPDATE_API_V1_SCHEMA,
+              error: 'another public update operation is already running',
+              failure: {
+                code: 'OPERATION_BUSY',
+                message: 'another public update operation is already running',
+                retryable: true,
+              },
+            })
+            return
+          }
+          const installedVersion = readInstalledVersion(config.profile, packageName, activeProfileDir)
+          if (installedVersion === null) {
+            sendJson(response, 404, {
+              schema: UPDATE_API_V1_SCHEMA,
+              error: 'plugin is not installed',
+              failure: {
+                code: 'PLUGIN_NOT_INSTALLED',
+                message: 'plugin is not installed in this profile',
+                retryable: false,
+              },
+            })
+            return
+          }
+          const operation = operationsV1.create(packageName, installedVersion)
+          operationsV1.start(operation.operationId)
+          void invokeLegacy('/dsh-market/update', request, 'POST', {
+            name: packageName,
+            ...(body.force === true ? { force: true } : {}),
+          }).then(({ status, payload }) => {
+            operationsV1.finish(
+              operation.operationId,
+              status,
+              payload,
+              readInstalledVersion(config.profile, packageName, activeProfileDir),
+            )
+          }).catch((error) => {
+            operationsV1.finish(
+              operation.operationId,
+              500,
+              { error: error instanceof Error ? error.message : String(error) },
+              readInstalledVersion(config.profile, packageName, activeProfileDir),
+            )
+          })
+          sendJson(response, 202, {
+            schema: UPDATE_API_V1_SCHEMA,
+            operation: operationsV1.get(operation.operationId),
+          })
+        } catch (error) {
+          sendJson(response, 400, {
+            schema: UPDATE_API_V1_SCHEMA,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/api/v1/operations',
+      handler: (request, response) => {
+        if (request.method !== 'GET') {
+          response.writeHead(405, { allow: 'GET' })
+          response.end()
+          return
+        }
+        const operation = operationsV1.get(operationIdFrom(request), progress)
+        if (operation === null) {
+          sendJson(response, 404, { schema: UPDATE_API_V1_SCHEMA, error: 'operation not found in this host process' })
+          return
+        }
+        sendJson(response, 200, { schema: UPDATE_API_V1_SCHEMA, operation })
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/api/v1/rollback',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { schema: UPDATE_API_V1_SCHEMA, error: 'untrusted origin' })
+          return
+        }
+        try {
+          const body = (await readJsonBody(request)) as { operationId?: unknown }
+          const operationId = typeof body.operationId === 'string' ? body.operationId : ''
+          const legacyRollbackId = operationsV1.beginRollback(operationId)
+          if (legacyRollbackId === null) {
+            sendJson(response, 409, { schema: UPDATE_API_V1_SCHEMA, error: 'rollback is not available for this operation' })
+            return
+          }
+          const result = await invokeLegacy('/dsh-market/rollback', request, 'POST', { rollbackId: legacyRollbackId })
+          const operation = operationsV1.finishRollback(operationId, result.status, result.payload)
+          sendJson(response, 200, { schema: UPDATE_API_V1_SCHEMA, operation })
+        } catch (error) {
+          sendJson(response, 400, {
+            schema: UPDATE_API_V1_SCHEMA,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/api/v1/restart',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        const result = await invokeLegacy('/dsh-market/restart', request, 'POST', {})
+        sendJson(response, result.status, { schema: UPDATE_API_V1_SCHEMA, result: result.payload })
+      },
+    }),
+
     host.webServer.register({
       kind: 'exact',
       path: '/dsh-market/backup',
@@ -877,6 +1220,7 @@ export function mountMarketRoutes(
           disabled: [...disabled],
           groups,
           groupOrder,
+          notes: readMarketState(activeProfileDir).notes ?? {},
           patch: { disables: patch.disables, forced: patch.forced, inserts: patch.inserts },
           patchDisabled: patchFlags.disabled,
           patchForced: patchFlags.forced,
@@ -1350,6 +1694,44 @@ export function mountMarketRoutes(
 
     host.webServer.register({
       kind: 'exact',
+      path: '/dsh-market/note',
+      handler: async (request, response) => {
+        if (request.method !== 'POST') {
+          response.writeHead(405, { allow: 'POST' })
+          response.end()
+          return
+        }
+        if (!sameOrigin(request)) {
+          sendJson(response, 403, { error: 'untrusted origin' })
+          return
+        }
+        try {
+          await withMutationLock(response, 'write', async () => {
+            const body = (await readJsonBody(request)) as { name?: unknown; text?: unknown } | null
+            const name = typeof body?.name === 'string' ? body.name : ''
+            if (name === '') {
+              sendJson(response, 400, { error: 'name is required / 需要 name' })
+              return
+            }
+            const state = readMarketState(activeProfileDir)
+            const notes = { ...state.notes }
+            const text = typeof body?.text === 'string' ? body.text.trim().slice(0, MAX_NOTE) : ''
+            // Empty clears rather than storing a blank: a row must not claim
+            // to carry a note the user just erased.
+            if (text === '') delete notes[name]
+            else notes[name] = text
+            writeMarketState(activeProfileDir, { ...state, notes })
+            refreshMarketState()
+            sendJson(response, 200, { ok: true, notes })
+          })
+        } catch (error) {
+          sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    }),
+
+    host.webServer.register({
+      kind: 'exact',
       path: '/dsh-market/groups',
       handler: async (request, response) => {
         if (request.method !== 'POST') {
@@ -1513,12 +1895,39 @@ export function mountMarketRoutes(
           'content-type': 'text/plain; charset=utf-8',
           'content-disposition': 'attachment; filename="dsh-market-log.txt"',
         })
+        // Built here, not in log.ts: this is the composition, and the log
+        // module deliberately knows nothing about profiles. Each declared
+        // bundle is marked with whether it actually resolves, because an
+        // unresolvable one is what stops the next boot (#339, #341) and it
+        // is invisible in a manifest listing on its own.
+        const snapshot: string[] = []
+        try {
+          const report = analyzeProfile(activeProfileDir)
+          const installed = readInstalled(config.profile, activeProfileDir)
+          snapshot.push(`dependencies (${String(Object.keys(installed).length)}):`)
+          for (const [name, spec] of Object.entries(installed)) snapshot.push(`  ${name}: ${spec}`)
+          snapshot.push(`bundles (${String(report.bundles.length)}):`)
+          for (const layer of report.bundles) {
+            const state = layer.directory !== null
+          ? 'ok'
+          : layer.unresolvedInbox === true
+            ? 'supplied by the dsh installation (not locatable from here)'
+            : 'NOT RESOLVED — the next start fails here'
+        snapshot.push(`  ${layer.name}: ${state}`)
+          }
+          if (report.summary.errors.length > 0) {
+            snapshot.push('errors:')
+            for (const line of report.summary.errors) snapshot.push(`  ${line}`)
+          }
+        } catch (error) {
+          snapshot.push(`profile state unavailable: ${error instanceof Error ? error.message : String(error)}`)
+        }
         response.end(exportLogs({
           'dsh-market': version,
           platform: `${process.platform} ${process.arch}`,
           node: process.version,
           profile: config.profile,
-        }))
+        }, snapshot, readPersistentLog(persistentLogFile)))
       },
     }),
 
@@ -1550,7 +1959,35 @@ export function mountMarketRoutes(
       },
     }),
 
+    // Read-only notes for the update dialog (#294): release body and/or a
+    // commit tail sliced at the installed sha, resolved from the catalog
+    // side's daily probe — no GitHub API call is made here, ever. The handler
+    // itself does not throw (every failure degrades to `kind: 'none'`), so a
+    // dialog that cannot load its data shows a neutral statement rather than
+    // an error banner.
     host.webServer.register({
+      kind: 'exact',
+      path: '/dsh-market/changelog',
+      handler: async (request, response) => {
+        if (request.method !== 'GET') {
+          response.writeHead(405, { allow: 'GET' })
+          response.end()
+          return
+        }
+        try {
+          const name = new URL(request.url ?? '/', 'http://localhost').searchParams.get('name') ?? ''
+          if (name === '') {
+            sendJson(response, 400, { error: 'name query parameter is required' })
+            return
+          }
+          sendJson(response, 200, await updateNotesFor(config.profile, activeProfileDir, name))
+        } catch (error) {
+          sendJson(response, 500, { error: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    }),
+
+    host.webServer.register(captureLegacy('/dsh-market/update', {
       kind: 'exact',
       path: '/dsh-market/update',
       handler: async (request, response) => {
@@ -1660,6 +2097,7 @@ export function mountMarketRoutes(
             // The market follows its channel; everything else is `latest`.
             const selfChannel = SELF_NAMES.has(name) ? activeChannel() : null
             const tag = selfChannel === null ? 'latest' : DIST_TAG[selfChannel]
+            let expectedNpmVersion: string | null = null
             // Re-accelerated from the unpinned shortcut, never from the
             // installed URL: that one names the commit already on disk, so
             // reusing it would be an update that can never move.
@@ -1695,6 +2133,7 @@ export function mountMarketRoutes(
               const registryLatest = selfChannel === null
                 ? await fetchNpmLatest(name)
                 : await versionOnChannel(name, selfChannel, await fetchNpmLatest(name))
+              expectedNpmVersion = registryLatest
               const refuse = selfChannel === null
                 ? installedVersion !== null && registryLatest !== null && !isUpgrade(installedVersion, registryLatest)
                 : installedVersion !== null && registryLatest !== null && installedVersion === registryLatest
@@ -1722,9 +2161,9 @@ export function mountMarketRoutes(
             // force: the user chose to install a fresh release without the
             // default one-day safety wait; scoped to this single command.
             const addArgs = force ? ['add', RELEASE_AGE_OVERRIDE, target] : ['add', target]
-            // RAW manifest snapshot for failure rollback (#65) — pnpm writes
-            // package.json before it finishes, so a hard-failed add leaves
-            // ghost/bumped entries that break every later pnpm run.
+            // Exact manifest snapshot for failure rollback (#65, #339) — the
+            // host can write dependencies AND dsh.profile.bundles before a
+            // hard-failed add, leaving residue that breaks the next boot.
             pendingRollbacks.clear()
             const compatibilityBefore = assessProfile(config.profile, activeProfileDir)
             // pnpm re-extracts the whole tree on any operation, so a plugin
@@ -1733,15 +2172,19 @@ export function mountMarketRoutes(
             // broke is attributable to it, so the profile is swept before as
             // well as after.
             const bundlesBefore = brokenClientBundles(config.profile, activeProfileDir)
-            const manifestBefore = readManifestDeps(config.profile, activeProfileDir)
+            const manifestBefore = readProfileManifestSnapshot(config.profile, activeProfileDir)
             const result = await runPlugin(config.profile, addArgs)
             const cancelled = result.cancelled
             if ((result.exitCode !== 0 || result.timedOut) && !cancelled) {
-              const rolledBack = restoreManifestDeps(config.profile, manifestBefore, activeProfileDir)
+              const rolledBack = restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
               if (rolledBack.length > 0) logEvent('warn', 'update', `${name}: rolled back manifest residue of the failed run: ${rolledBack.join(', ')}`)
             }
             let ok = result.exitCode === 0 && !result.timedOut && !cancelled
             let stale = false
+            let versionFailureCode: 'DOWNGRADE_DETECTED' | 'RESOLVED_VERSION_MISMATCH' | null = null
+            let versionFailureError: string | null = null
+            let rollbackOk = true
+            let rollbackDetail: string | null = null
             let activation: Record<string, ReturnType<typeof verifyActivation>> | undefined
             if (ok) {
               if (restore) {
@@ -1763,6 +2206,54 @@ export function mountMarketRoutes(
                 if (stale) ok = false
               }
             }
+            // pnpm's minimumReleaseAge can silently resolve `@latest` to an
+            // OLDER release and still exit 0. The old stale check only caught
+            // "same version"; a real 0.2.24 -> 0.2.23 regression therefore
+            // looked like a successful update. Verify the bytes that actually
+            // landed against both the pre-update version and the registry
+            // target, then rematerialize the previous build on any mismatch.
+            if (ok && !isGit && !restore) {
+              const afterVersion = readInstalledVersion(config.profile, name, activeProfileDir)
+              const direction = beforeVersion !== null && afterVersion !== null
+                ? compareVersions(afterVersion, beforeVersion)
+                : null
+              const unexpectedDowngrade = selfChannel === null && direction !== null && direction < 0
+              // Only a version BELOW the target is a mismatch. `latest` can move
+              // forward while pnpm is still downloading — a large plugin gives
+              // the author minutes of window — and rejecting the newer release
+              // that arrives would roll back a good update and report it as a
+              // failure. Getting less than we asked for is the actual symptom.
+              const target = expectedNpmVersion
+              const targetOrder = target !== null && afterVersion !== null
+                ? compareVersions(afterVersion, target)
+                : null
+              const targetMismatch = target !== null && (
+                afterVersion === null
+                || (targetOrder !== null
+                  // Comparable: getting LESS than we asked for is the symptom.
+                  // A version above the target is `latest` moving forward while
+                  // pnpm was still downloading, which is a good update.
+                  ? targetOrder < 0
+                  // Not comparable as semver. With no way to tell forward from
+                  // back, keep the exact check this replaced.
+                  : afterVersion !== target)
+              )
+              if (unexpectedDowngrade || targetMismatch) {
+                versionFailureCode = unexpectedDowngrade ? 'DOWNGRADE_DETECTED' : 'RESOLVED_VERSION_MISMATCH'
+                versionFailureError = unexpectedDowngrade
+                  ? `${name} 更新实际解析为 v${afterVersion ?? 'unknown'}，低于更新前的 v${beforeVersion ?? 'unknown'}；已拒绝降级并自动恢复原版本。 / ${name} resolved to v${afterVersion ?? 'unknown'}, below the installed v${beforeVersion ?? 'unknown'}; the downgrade was rejected and the previous build was restored.`
+                  : `${name} 更新目标为 v${expectedNpmVersion ?? 'unknown'}，但实际安装为 v${afterVersion ?? 'unknown'}；已自动恢复原版本。 / ${name} targeted v${expectedNpmVersion ?? 'unknown'} but installed v${afterVersion ?? 'unknown'}; the previous build was restored.`
+                ok = false
+                const rollback = await rollbackUpdateBuild(name, manifestBefore)
+                rollbackOk = rollback.ok
+                rollbackDetail = rollback.detail
+                if (!rollback.ok) {
+                  versionFailureError += ` 回滚未能恢复原版本文件：${rollback.detail ?? 'unknown'} / Rollback could not restore the previous build: ${rollback.detail ?? 'unknown'}`
+                }
+                logEvent('error', 'update-version',
+                  `${name}: ${versionFailureCode} before=${beforeVersion ?? 'unknown'} expected=${expectedNpmVersion ?? 'unknown'} actual=${afterVersion ?? 'unknown'}${rollback.ok ? '; previous build restored' : `; rollback failed: ${rollback.detail ?? 'unknown'}`}`)
+              }
+            }
             // The new build has to be loadable (#159). pnpm exits 0 for any
             // tarball it can extract, and the version really did change, so
             // nothing above notices a package that arrived without its entry
@@ -1775,8 +2266,6 @@ export function mountMarketRoutes(
             // the OLD code that is already in memory. The failure only
             // surfaces on the next boot, as a profile that will not start.
             let brokenEntry = false
-            let rollbackOk = true
-            let rollbackDetail: string | null = null
             if (ok && !hasLoadableEntry(activeProfileDir, name)) {
               brokenEntry = true
               ok = false
@@ -1898,8 +2387,13 @@ export function mountMarketRoutes(
               activation,
               compatibility,
               ignoredBuilds,
+              // Named here rather than left for the next restart to find
+              // (#339). Empty on every healthy operation, so the client only
+              // ever sees this when something really is unbootable.
+              ...(() => { const orphans = orphanBundles(); return orphans.length > 0 ? { orphanBundles: orphans } : {} })(),
               staleReason: staleReason ?? undefined,
-              error: trialError ?? brokenEntryError ?? staleError ?? undefined,
+              failureCode: versionFailureCode ?? undefined,
+              error: versionFailureError ?? trialError ?? brokenEntryError ?? staleError ?? undefined,
               exitCode: result.exitCode,
               timedOut: result.timedOut,
               stdout: result.stdout,
@@ -1914,7 +2408,7 @@ export function mountMarketRoutes(
           sendJson(response, 500, { error: message })
         }
       },
-    }),
+    })),
 
     host.webServer.register({
       kind: 'exact',
@@ -2150,7 +2644,7 @@ export function mountMarketRoutes(
       },
     }),
 
-    host.webServer.register({
+    host.webServer.register(captureLegacy('/dsh-market/restart', {
       kind: 'exact',
       path: '/dsh-market/restart',
       handler: (request, response) => {
@@ -2188,7 +2682,7 @@ export function mountMarketRoutes(
           sendJson(response, 500, { error: message })
         }
       },
-    }),
+    })),
 
     host.webServer.register({
       kind: 'exact',
@@ -2484,7 +2978,7 @@ export function mountMarketRoutes(
       },
     }),
 
-    host.webServer.register({
+    host.webServer.register(captureLegacy('/dsh-market/rollback', {
       kind: 'exact',
       path: '/dsh-market/rollback',
       handler: async (request, response) => {
@@ -2549,7 +3043,7 @@ export function mountMarketRoutes(
           sendJson(response, 500, { error: message })
         }
       },
-    }),
+    })),
 
     host.webServer.register({
       kind: 'exact',
@@ -2681,16 +3175,17 @@ export function mountMarketRoutes(
             // broke is attributable to it, so the profile is swept before as
             // well as after.
             const bundlesBefore = brokenClientBundles(config.profile, activeProfileDir)
-            // RAW manifest snapshot for failure rollback (#65): pnpm writes
-            // package.json before the build-script check / registry fetches
-            // run, so a hard-failed add leaves ghost dependencies that break
-            // every later pnpm run — of anything. Cancelled runs keep their
-            // partial state on purpose (the user sees the diff and decides).
-            const manifestBefore = readManifestDeps(config.profile, activeProfileDir)
+            // Exact manifest snapshot for failure rollback (#65, #339): the
+            // host writes dependencies and dsh.profile.bundles before the
+            // build-script check / registry fetches run. Either residue can
+            // break every later operation or the next boot. Cancelled runs
+            // keep their partial state on purpose (the user sees the diff
+            // and decides).
+            const manifestBefore = readProfileManifestSnapshot(config.profile, activeProfileDir)
             const result = await runPlugin(config.profile, ['add', target])
             const cancelled = result.cancelled
             if ((result.exitCode !== 0 || result.timedOut) && !cancelled) {
-              const rolledBack = restoreManifestDeps(config.profile, manifestBefore, activeProfileDir)
+              const rolledBack = restoreProfileManifest(config.profile, manifestBefore, activeProfileDir)
               if (rolledBack.length > 0) logEvent('warn', 'install', `${target}: rolled back manifest residue of the failed run: ${rolledBack.join(', ')}`)
             }
             let ok = result.exitCode === 0 && !result.timedOut && !cancelled
@@ -2815,6 +3310,17 @@ export function mountMarketRoutes(
               activation,
               compatibility,
               ignoredBuilds,
+              // Named here rather than left for the next restart to find
+              // (#339). Empty on every healthy operation, so the client only
+              // ever sees this when something really is unbootable.
+              ...(() => { const orphans = orphanBundles(); return orphans.length > 0 ? { orphanBundles: orphans } : {} })(),
+              // Only on a failure, and only for a subpath target: a stale
+              // catalog entry produces a pnpm error that reads like the
+              // user's fault (#346).
+              ...(ok || cancelled ? {} : await (async () => {
+                const stale = await staleSubpath(plainTarget ?? '')
+                return stale === null ? {} : { staleEntry: stale }
+              })()),
               // Blocked build scripts are expected (pnpm >= 10 blocks them by
               // default): surface the approve-builds banner instead of scaring
               // the user with pnpm's raw stack.
@@ -2864,6 +3370,7 @@ export function mountMarketRoutes(
   ]
 
   return () => {
+    configurePersistentLog(null)
     for (const dispose of disposers) dispose()
   }
 }

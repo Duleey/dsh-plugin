@@ -10,6 +10,28 @@ export type { SharedHostPackageDependencyFinding } from '../diagnostics.ts'
 export type LocalizedText = Record<string, string | undefined>
 
 /** One registry entry from /dsh-market/registry. */
+/**
+ * Resolve a market API path against the page the UI is served from.
+ *
+ * Every call used to be root-absolute (`/dsh-market/…`), which the browser
+ * resolves against the ORIGIN — so behind a reverse proxy that mounts dsh
+ * under a prefix (`https://host/app/my-dsh/`), the panel rendered and then
+ * every request in it went to `https://host/dsh-market/…`, missed the prefix
+ * rule entirely, and 404'd (#345).
+ *
+ * Anchored on `document.baseURI`, which is the directory the host serves its
+ * UI from. Safe for root deployments because that directory is `/` there, and
+ * safe generally because the dsh web UI does not use path routing — measured
+ * against a real dsh: `location.pathname` is `/` on the market page, not
+ * `/settings/...`, so the directory really is the mount point rather than
+ * wherever the user happens to have navigated.
+ */
+export function api(path: string): string {
+  const relative = path.replace(/^\/+/, '')
+  if (typeof document === 'undefined') return `/${relative}`
+  return new URL(relative, document.baseURI).pathname
+}
+
 export interface RegistryPlugin {
   name: string
   owner: string
@@ -93,6 +115,11 @@ export interface UpdateStatus {
   updateAvailable?: boolean
   version?: string
   kind?: string
+  /** What is installed and what the source of truth offers — versions for npm
+      packages, commit shas for github installs; the notes dialog (#294) shows
+      the range between them in whichever form reads best. */
+  current?: string | null
+  latest?: string | null
 }
 
 /** Poll payload from /dsh-market/status. */
@@ -982,10 +1009,10 @@ export function humanOutput(raw: string): string {
  *
  * The catalog's `name` is an IDENTITY, and for the 104 entries that live in
  * a repository holding several plugins it is a compound one:
- * `dsh-web-ui#packages/dsh-web-ui-all`. Shown verbatim it puts a repository
+ * `dsh-web#packages/dsh-web-all`. Shown verbatim it puts a repository
  * path in front of a user who did not ask about repositories — and worse, it
  * disagrees with the market's own installed list, which reads names out of
- * the profile manifest and calls the same plugin `dsh-web-ui-all`. The same
+ * the profile manifest and calls the same plugin `dsh-web-all`. The same
  * thing had two names either side of the Install button.
  *
  * A card answers two questions: who made it, and what is it called. The

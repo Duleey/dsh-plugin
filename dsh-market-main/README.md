@@ -31,12 +31,14 @@ its own dsh: it may be older than the one `npm` would give you (#139).
 
 ## What you get
 
-- **Browse & search** the full community catalog (1550+ plugins, growing daily) — category filters, star counts, top/new sorting, bilingual descriptions that follow your UI language
+- **Browse & search** the full community catalog (2300+ plugins, growing daily) — category filters, star counts, top/new sorting, bilingual descriptions that follow your UI language
 - **Screenshots** — AppStore-style screenshots, auto-carousel when there's more than one, click to preview full-size: author-curated shots show right on the card (zero extra requests); plugins without curated shots fall back to automatic README extraction once you open the install dialog. Images load from GitHub hosting only
+- **Comments** — every card opens the plugin's discussion thread in place. It is the same thread its pages on [dshmarket.com](https://dshmarket.com) and the [catalog](https://awesome-dsh-plugin.com) show, so a plugin has one conversation rather than three. Backed by GitHub Discussions through giscus: it loads when you open it, needs a GitHub account only to post, and the note above it says plainly that opening it contacts giscus.app and GitHub
 - **Themes** — a dedicated tab for community themes and skins: install → active immediately, switch with one click (themes are mutually exclusive, your choice survives restarts), uninstall to revert
 - **One-click install** — confirm the source, watch live progress; most plugins go live after a page refresh, no restart
 - **Backup & restore** — export your profile's plugin list and configuration as readable JSON, import it on another machine, store it on WebDAV with daily auto-backup, or sync through a private GitHub Gist; restores **merge** (plugins installed after the backup are kept), validate before writing, and roll back on failure
 - **Updates** — per-plugin update checks (npm version or pinned commit vs HEAD), one-click update, or update everything at once; the market updates itself the same way
+- **Public update API** — plugin-owned settings pages can use the versioned, capability-gated [update API v1](UPDATE-API-V1.md) (beta) instead of copying package-manager logic or depending on private Market UI responses
 - **Uninstall** — two-step confirm; plugins installed this session are removed live
 - **Hot disable / enable** — toggles write `- id: …` + `disabled: true|false` into the profile's `cordis.patch.yml` (the official patch layer, mechanism ported from [dsh-plugin-hub](https://github.com/Noob-stupid/dsh-plugin-hub)): DSH's HMR re-composes within ~1s, no restart, and the loader re-applies the choice on every boot; hand-edited patch rows show as badges, host-infrastructure plugins are protected from toggling, and a malformed patch file is never made worse
 - **Restart when needed** — changes that cannot hot-load show a one-click restart beside the pending-change banner; the action is restricted to same-origin loopback requests
@@ -108,6 +110,10 @@ DSHM_REGISTRY_URL=https://your-mirror.example/plugins.json dsh web
 ### DeepSeek Harness Desktop (anywhere-labs)
 
 [deepseek-harness-desktop](https://github.com/anywhere-labs/deepseek-harness-desktop) — an Electron desktop app for DeepSeek Harness built around the idea that everything is a plugin, including the desktop itself: profile switching, a bundled Node and pnpm, and a recoverable install path that snapshots the profile before a change. [dshdesktop.cn](https://dshdesktop.cn)
+
+### DSH App
+
+[dsh-app](https://github.com/RyensX/dsh-app) — a DeepSeek Harness desktop client built on Tauri 2 rather than Electron, so it ships a much smaller binary and uses the system webview. AGPL-3.0.
 
 ### DSH Get
 
